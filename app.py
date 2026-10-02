@@ -88,23 +88,24 @@ def init_admins():
             json.dump(default_admins, f, ensure_ascii=False, indent=2)
 
 
+@st.cache_data(ttl=600)
 def get_admins() -> Dict[str, str]:
-    """取得所有管理員資訊 (PIN -> 名稱)"""
+    """取得所有管理員資訊 (PIN -> 名稱) - 快取 600 秒"""
     init_admins()
     try:
         with open(ADMIN_CONFIG_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        st.error(f"讀取管理人設定失敗: {e}")
         return {"0218": "KC", "0311": "Aileen"}
 
 
 def save_admins(admins: Dict[str, str]) -> bool:
-    """儲存管理員資訊"""
+    """儲存管理員資訊並清空快取"""
     ensure_directories()
     try:
         with open(ADMIN_CONFIG_PATH, "w", encoding="utf-8") as f:
             json.dump(admins, f, ensure_ascii=False, indent=2)
+        st.cache_data.clear()
         return True
     except Exception as e:
         st.error(f"寫入管理人設定失敗: {e}")
@@ -164,7 +165,7 @@ def init_db():
 
 
 def add_audit_log(operator: str, action: str, details: str):
-    """新增一筆操作紀錄"""
+    """新增一筆操作紀錄並清除快取"""
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -175,12 +176,14 @@ def add_audit_log(operator: str, action: str, details: str):
         )
         conn.commit()
         conn.close()
+        st.cache_data.clear()
     except Exception as e:
         print(f"[Audit Log Error] {e}")
 
 
+@st.cache_data(ttl=600)
 def get_audit_logs(limit: int = 200) -> pd.DataFrame:
-    """取得稽核操作紀錄清單"""
+    """取得稽核操作紀錄清單 - 快取 600 秒"""
     try:
         conn = get_db_connection()
         query = "SELECT timestamp as '時間戳記', operator as '操作者', action as '操作動作', details as '具體細節' FROM audit_logs ORDER BY id DESC LIMIT ?"
@@ -188,7 +191,6 @@ def get_audit_logs(limit: int = 200) -> pd.DataFrame:
         conn.close()
         return df
     except Exception as e:
-        st.error(f"讀取操作日誌失敗: {e}")
         return pd.DataFrame()
 
 
@@ -223,8 +225,9 @@ def generate_booking_code(check_in: date) -> str:
     return f"LY-{check_in.strftime('%Y%m%d')}-{rand_suffix}"
 
 
+@st.cache_data(ttl=600)
 def query_historical_stats(phone: str, name: str = "") -> Tuple[int, str]:
-    """根據電話 (與姓名) 查詢歷史來訪次數與歷史標籤"""
+    """根據電話 (與姓名) 查詢歷史來訪次數與歷史標籤 - 快取 600 秒"""
     if not phone:
         return 1, "一般"
     try:
@@ -240,6 +243,52 @@ def query_historical_stats(phone: str, name: str = "") -> Tuple[int, str]:
         return total_count, tag
     except Exception:
         return 1, "一般"
+
+
+@st.cache_data(ttl=600)
+def get_dashboard_summary(selected_date_str: str) -> Tuple[Dict[str, int], pd.DataFrame, pd.DataFrame]:
+    """查詢選定日期各區域佔用數量、當日入住名單、當日退房名單 - 快取 600 秒"""
+    conn = get_db_connection()
+    query_occ = """
+        SELECT area, SUM(quantity) as booked_units, COUNT(*) as booking_count
+        FROM bookings
+        WHERE ? >= check_in_date AND ? < check_out_date
+        GROUP BY area
+    """
+    df_occupied = pd.read_sql_query(query_occ, conn, params=(selected_date_str, selected_date_str))
+    occupied_map = {row["area"]: row["booked_units"] for _, row in df_occupied.iterrows()}
+
+    df_in = pd.read_sql_query(
+        "SELECT booking_code as '訂單編號', name as '姓名', phone as '電話', area as '區域', quantity as '數量', night_rush as '夜衝', tag as '標籤' FROM bookings WHERE check_in_date = ?",
+        conn,
+        params=(selected_date_str,),
+    )
+
+    df_out = pd.read_sql_query(
+        "SELECT booking_code as '訂單編號', name as '姓名', phone as '電話', area as '區域', quantity as '數量', total_amount as '金額' FROM bookings WHERE check_out_date = ?",
+        conn,
+        params=(selected_date_str,),
+    )
+    conn.close()
+    return occupied_map, df_in, df_out
+
+
+@st.cache_data(ttl=600)
+def fetch_bookings_df(query: str, params: Tuple[Any, ...]) -> pd.DataFrame:
+    """查詢過濾訂單列表 - 快取 600 秒"""
+    conn = get_db_connection()
+    df = pd.read_sql_query(query, conn, params=params)
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=600)
+def fetch_all_bookings_df() -> pd.DataFrame:
+    """查詢全量訂單列表 - 快取 600 秒"""
+    conn = get_db_connection()
+    df = pd.read_sql_query("SELECT * FROM bookings ORDER BY check_in_date DESC", conn)
+    conn.close()
+    return df
 
 
 def format_phone_number(raw_val) -> str:
@@ -477,15 +526,15 @@ def check_authentication() -> bool:
 
 
 def render_login_view():
-    """渲染 PIN 碼登入畫面"""
-    col1, col2, col3 = st.columns([1, 1.8, 1])
+    """渲染極簡安全 PIN 碼登入畫面"""
+    col1, col2, col3 = st.columns([1, 1.6, 1])
     with col2:
         st.markdown(
             """
-            <div style="text-align: center; padding: 30px 20px; background: white; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.08); border-top: 6px solid #2E7D32;">
-                <h1 style="color: #1B5E20; font-size: 2.2rem; margin-bottom: 6px;">⛺ 祿野營地</h1>
-                <h3 style="color: #424242; font-weight: 500; margin-top: 0;">訂位管理系統</h3>
-                <p style="color: #757575; font-size: 0.95rem;">請輸入 4 位數管理員 PIN 碼登入系統</p>
+            <div style="text-align: center; padding: 32px 24px; background: white; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.06); border-top: 6px solid #2E7D32;">
+                <h1 style="color: #1B5E20; font-size: 2.2rem; margin-bottom: 8px;">⛺ 祿野營地</h1>
+                <h3 style="color: #424242; font-weight: 500; margin-top: 0; margin-bottom: 6px;">訂位管理系統</h3>
+                <p style="color: #757575; font-size: 0.95rem; margin-bottom: 0;">請輸入管理員 PIN 碼</p>
             </div>
             """,
             unsafe_allow_html=True,
@@ -493,7 +542,7 @@ def render_login_view():
         st.write("")
 
         with st.form("login_form"):
-            pin_input = st.text_input("🔑 4 位數 PIN 碼", type="password", max_chars=4, placeholder="請輸入 4 位數字...")
+            pin_input = st.text_input("🔑 管理員 PIN 碼", type="password", max_chars=8, placeholder="請輸入 PIN 碼...")
             submit = st.form_submit_button("進入系統", use_container_width=True, type="primary")
 
             if submit:
@@ -506,17 +555,7 @@ def render_login_view():
                     st.success(f"歡迎回來，{user_name}！登入成功。")
                     st.rerun()
                 else:
-                    st.error("PIN 碼錯誤！請重新確認或聯繫負責人。")
-
-        st.markdown(
-            """
-            <div style="margin-top: 25px; padding: 12px; background: #F1F8E9; border-radius: 8px; font-size: 0.85rem; color: #33691E; text-align: center;">
-                💡 <b>預設管理人 PIN 碼提醒</b>：<br>
-                <code>0218</code> ➔ KC &nbsp;|&nbsp; <code>0311</code> ➔ Aileen
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+                    st.error("PIN 碼錯誤，請重新輸入")
 
 
 # ==============================================================================
@@ -528,18 +567,8 @@ def render_dashboard_view():
     today = date.today()
     selected_date = st.date_input("📅 選擇欲檢視的營位日期：", value=today, min_value=today - timedelta(days=365))
 
-    # 查詢該日期各區預約狀態
-    conn = get_db_connection()
-    query = """
-        SELECT area, SUM(quantity) as booked_units, COUNT(*) as booking_count
-        FROM bookings
-        WHERE ? >= check_in_date AND ? < check_out_date
-        GROUP BY area
-    """
-    df_occupied = pd.read_sql_query(query, conn, params=(selected_date.strftime("%Y-%m-%d"), selected_date.strftime("%Y-%m-%d")))
-    conn.close()
-
-    occupied_map = {row["area"]: row["booked_units"] for _, row in df_occupied.iterrows()}
+    # 透過快取查詢該日期各區預約狀態與名單 (600秒快取)
+    occupied_map, df_in, df_out = get_dashboard_summary(selected_date.strftime("%Y-%m-%d"))
 
     # 顯示三大區域卡片
     cols = st.columns(3)
@@ -583,32 +612,21 @@ def render_dashboard_view():
 
     # 今日/選定日期當天入住名單與退房名單
     col_in, col_out = st.columns(2)
-    conn = get_db_connection()
     with col_in:
         st.markdown(f"#### 🚪 {selected_date.strftime('%Y-%m-%d')} 當日【辦理入住】名單")
-        df_in = pd.read_sql_query(
-            "SELECT booking_code as '訂單編號', name as '姓名', phone as '電話', area as '區域', quantity as '數量', night_rush as '夜衝', tag as '標籤' FROM bookings WHERE check_in_date = ?",
-            conn,
-            params=(selected_date.strftime("%Y-%m-%d"),),
-        )
         if not df_in.empty:
-            df_in["夜衝"] = df_in["夜衝"].apply(lambda x: "⚡ 是" if x == 1 else "否")
-            st.dataframe(df_in, use_container_width=True, hide_index=True)
+            df_in_display = df_in.copy()
+            df_in_display["夜衝"] = df_in_display["夜衝"].apply(lambda x: "⚡ 是" if x == 1 else "否")
+            st.dataframe(df_in_display, use_container_width=True, hide_index=True)
         else:
             st.info("當日無新入住訂單。")
 
     with col_out:
         st.markdown(f"#### 🚗 {selected_date.strftime('%Y-%m-%d')} 當日【預計退房】名單")
-        df_out = pd.read_sql_query(
-            "SELECT booking_code as '訂單編號', name as '姓名', phone as '電話', area as '區域', quantity as '數量', total_amount as '金額' FROM bookings WHERE check_out_date = ?",
-            conn,
-            params=(selected_date.strftime("%Y-%m-%d"),),
-        )
         if not df_out.empty:
             st.dataframe(df_out, use_container_width=True, hide_index=True)
         else:
             st.info("當日無預計退房訂單。")
-    conn.close()
 
 
 # ==============================================================================
@@ -695,9 +713,8 @@ def render_bookings_view():
 
     query += " ORDER BY check_in_date DESC, id DESC"
 
-    conn = get_db_connection()
-    df_results = pd.read_sql_query(query, conn, params=params)
-    conn.close()
+    # 使用快取函式 (600秒快取)
+    df_results = fetch_bookings_df(query, tuple(params))
 
     st.markdown(f"**找到 `{len(df_results)}` 筆符合條件的訂單**")
 
@@ -785,7 +802,7 @@ def render_bookings_view():
                     with btn_c1:
                         if st.button("✏️ 編輯", key=f"edit_btn_{row['id']}"):
                             st.session_state["editing_booking_id"] = row["id"]
-                            st.session_state["nav_page"] = "➕ 新增/編輯預約"
+                            st.session_state["main_navigation"] = "➕ 新增露營預約"
                             st.rerun()
                     with btn_c2:
                         with st.popover("🗑️ 刪除"):
@@ -798,6 +815,7 @@ def render_bookings_view():
                                 del_conn.commit()
                                 del_conn.close()
 
+                                st.cache_data.clear()
                                 add_audit_log(
                                     current_user,
                                     "刪除訂單",
@@ -977,6 +995,7 @@ def render_booking_form_view():
                             ),
                         )
                         conn.commit()
+                        st.cache_data.clear()
                         add_audit_log(
                             current_user,
                             "修改訂單",
@@ -1014,6 +1033,7 @@ def render_booking_form_view():
                             ),
                         )
                         conn.commit()
+                        st.cache_data.clear()
                         add_audit_log(
                             current_user,
                             "新增訂單",
@@ -1043,9 +1063,8 @@ def render_import_export_view():
         st.markdown("#### 1. 匯出目前營地所有露營客訂單資料")
         st.write("點擊下方按鈕可將系統中完整的露營客訂位紀錄、金額與備註匯出為 Excel 或 CSV 試算表。")
 
-        conn = get_db_connection()
-        df_all = pd.read_sql_query("SELECT * FROM bookings ORDER BY check_in_date DESC", conn)
-        conn.close()
+        # 使用快取全量查詢 (600秒快取)
+        df_all = fetch_all_bookings_df()
 
         if not df_all.empty:
             df_export = df_all.copy()
@@ -1296,6 +1315,7 @@ def render_import_export_view():
                     conn.commit()
                     conn.close()
 
+                    st.cache_data.clear()
                     add_audit_log(
                         current_user,
                         "批次匯入訂單",
@@ -1491,7 +1511,28 @@ def render_cloud_sync_view():
 
 
 # ==============================================================================
-# 14. 主程式入口與導覽路由 (Main App Entry)
+# 14. 系統管理整合中心 (System Management Tabs)
+# ==============================================================================
+def render_system_management_view():
+    st.markdown("### ⚙️ 系統管理與資料維護")
+    tab_admin, tab_data, tab_logs, tab_cloud = st.tabs([
+        "👤 管理人帳號管理",
+        "📁 資料匯入與匯出",
+        "📜 操作日誌 (Note Log)",
+        "☁️ 雲端備份與設定",
+    ])
+    with tab_admin:
+        render_admin_management_view()
+    with tab_data:
+        render_import_export_view()
+    with tab_logs:
+        render_audit_log_view()
+    with tab_cloud:
+        render_cloud_sync_view()
+
+
+# ==============================================================================
+# 15. 主程式入口與導覽路由 (Main App Entry)
 # ==============================================================================
 def main():
     apply_custom_styles()
@@ -1502,6 +1543,16 @@ def main():
     if not check_authentication():
         render_login_view()
         return
+
+    # 初始化固定 navigation key，防止重複點擊與 state 丟失
+    nav_options = [
+        "📊 營位總覽看板",
+        "➕ 新增露營預約",
+        "🔍 訂位管理與搜尋",
+        "⚙️ 系統管理",
+    ]
+    if "main_navigation" not in st.session_state or st.session_state["main_navigation"] not in nav_options:
+        st.session_state["main_navigation"] = nav_options[0]
 
     # 頂部橫幅 Header
     st.markdown(
@@ -1523,31 +1574,16 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # 側邊欄導覽
+    # 側邊欄導覽 (使用固定 key 管理 State，防止切換延遲與多次點擊問題)
     with st.sidebar:
         st.markdown("### 🌲 祿野營地導覽選單")
         st.write(f"目前登入者：**{st.session_state.get('authenticated_user', '管理員')}**")
 
-        default_nav = st.session_state.get("nav_page", "⛺ 營位總覽看板")
-        nav_options = [
-            "⛺ 營位總覽看板",
-            "📋 訂單管理與搜尋",
-            "➕ 新增/編輯預約",
-            "📤 資料匯入與匯出",
-            "📜 操作日誌 (Log)",
-            "🔑 管理人帳號管理",
-            "☁️ 雲端備份與同步",
-        ]
-
-        if default_nav not in nav_options:
-            default_nav = nav_options[0]
-
         page_selection = st.radio(
-            "前往分頁：",
+            "前往模組：",
             nav_options,
-            index=nav_options.index(default_nav),
+            key="main_navigation",
         )
-        st.session_state["nav_page"] = page_selection
 
         st.write("---")
 
@@ -1575,20 +1611,14 @@ def main():
             st.rerun()
 
     # 路由渲染對應頁面
-    if page_selection == "⛺ 營位總覽看板":
+    if page_selection == "📊 營位總覽看板":
         render_dashboard_view()
-    elif page_selection == "📋 訂單管理與搜尋":
-        render_bookings_view()
-    elif page_selection == "➕ 新增/編輯預約":
+    elif page_selection == "➕ 新增露營預約":
         render_booking_form_view()
-    elif page_selection == "📤 資料匯入與匯出":
-        render_import_export_view()
-    elif page_selection == "📜 操作日誌 (Log)":
-        render_audit_log_view()
-    elif page_selection == "🔑 管理人帳號管理":
-        render_admin_management_view()
-    elif page_selection == "☁️ 雲端備份與同步":
-        render_cloud_sync_view()
+    elif page_selection == "🔍 訂位管理與搜尋":
+        render_bookings_view()
+    elif page_selection == "⚙️ 系統管理":
+        render_system_management_view()
 
 
 if __name__ == "__main__":
