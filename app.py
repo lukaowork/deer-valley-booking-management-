@@ -242,6 +242,25 @@ def query_historical_stats(phone: str, name: str = "") -> Tuple[int, str]:
         return 1, "一般"
 
 
+def format_phone_number(raw_val) -> str:
+    """清理並格式化電話號碼：去除小數點 .0，轉為純字串並補齊開頭 0"""
+    if pd.isna(raw_val) or raw_val is None:
+        return ""
+    val_str = str(raw_val).strip()
+    if val_str.endswith(".0"):
+        val_str = val_str[:-2]
+    # 清除破折號與空格
+    val_str = val_str.replace("-", "").replace(" ", "")
+    if val_str.lower() in ["nan", "none", "null"]:
+        return ""
+    # 若為純數字且長度為9碼(通常遺失開頭0)，自動補齊開頭 '0'
+    if val_str.isdigit() and len(val_str) == 9 and val_str.startswith("9"):
+        val_str = "0" + val_str
+    elif val_str.isdigit() and 0 < len(val_str) <= 9 and not val_str.startswith("0"):
+        val_str = "0" + val_str
+    return val_str
+
+
 # ==============================================================================
 # 4. Google Drive 雲端同步模組 (含自動降級機制)
 # ==============================================================================
@@ -1136,6 +1155,26 @@ def render_import_export_view():
                 else:
                     df_upload = pd.read_excel(uploaded_file)
 
+                # 欄位靈活配對
+                in_col = next((c for c in ["主要入住日期", "入住日期", "check_in_date", "check_in"] if c in df_upload.columns), None)
+                out_col = next((c for c in ["退房日期", "check_out_date", "check_out"] if c in df_upload.columns), None)
+                phone_col = next((c for c in ["露營人電話", "電話", "phone", "mobile"] if c in df_upload.columns), None)
+
+                # 1. 增強日期欄位容錯解析機制 (pd.to_datetime(..., errors='coerce'))
+                today_str = date.today().strftime("%Y-%m-%d")
+                if in_col:
+                    df_upload[in_col] = pd.to_datetime(df_upload[in_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna(today_str)
+                    # 避免空字串情況，統一填補當天日期
+                    df_upload[in_col] = df_upload[in_col].apply(lambda x: today_str if not str(x).strip() or str(x).strip().lower() == "nan" else str(x).strip())
+
+                if out_col:
+                    df_upload[out_col] = pd.to_datetime(df_upload[out_col], format="mixed", errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
+                    df_upload[out_col] = df_upload[out_col].apply(lambda x: "" if not str(x).strip() or str(x).strip().lower() == "nan" else str(x).strip())
+
+                # 2. 增強電話號碼欄位容錯解析機制 (去除 .0 並補齊開頭 0)
+                if phone_col:
+                    df_upload[phone_col] = df_upload[phone_col].apply(format_phone_number)
+
                 st.write("預覽上傳內容（前 5 筆）：")
                 st.dataframe(df_upload.head(5), use_container_width=True)
 
@@ -1151,28 +1190,67 @@ def render_import_export_view():
 
                     for idx, row in df_upload.iterrows():
                         try:
-                            # 欄位靈活配對
+                            # 姓名與電話解析
                             name = str(row.get("露營人姓名", row.get("name", ""))).strip()
-                            phone = str(row.get("露營人電話", row.get("phone", ""))).strip()
+                            if name.lower() == "nan":
+                                name = ""
+
+                            raw_phone = row.get(phone_col) if phone_col else row.get("露營人電話", row.get("phone", ""))
+                            phone = format_phone_number(raw_phone)
+
+                            # 預約區域解析
                             area = str(row.get("預約區域", row.get("area", "雨棚區"))).strip()
                             if area not in CAMP_AREAS:
                                 area = "雨棚區"
 
-                            in_raw = str(row.get("主要入住日期", row.get("check_in_date", "")))[:10]
-                            out_raw = str(row.get("退房日期", row.get("check_out_date", "")))[:10]
-                            check_in = datetime.strptime(in_raw, "%Y-%m-%d").date()
-                            check_out = datetime.strptime(out_raw, "%Y-%m-%d").date()
+                            # 日期安全解析 (確保絕不丟出 ValueError)
+                            in_raw = str(row.get(in_col, "") if in_col else row.get("主要入住日期", row.get("check_in_date", ""))).strip()
+                            try:
+                                if in_raw and in_raw.lower() != "nan":
+                                    check_in = datetime.strptime(in_raw[:10], "%Y-%m-%d").date()
+                                else:
+                                    check_in = date.today()
+                            except Exception:
+                                check_in = date.today()
 
-                            qty = int(row.get("帳數/間數", row.get("quantity", 1)))
+                            out_raw = str(row.get(out_col, "") if out_col else row.get("退房日期", row.get("check_out_date", ""))).strip()
+                            try:
+                                if out_raw and out_raw.lower() != "nan":
+                                    check_out = datetime.strptime(out_raw[:10], "%Y-%m-%d").date()
+                                else:
+                                    check_out = check_in + timedelta(days=1)
+                            except Exception:
+                                check_out = check_in + timedelta(days=1)
+
+                            # 若退房日期早於或等於入住日期，自動修正為入住隔天
+                            if check_out <= check_in:
+                                check_out = check_in + timedelta(days=1)
+
+                            # 數量解析
+                            raw_qty = row.get("帳數/間數", row.get("quantity", 1))
+                            try:
+                                qty = int(float(raw_qty)) if not pd.isna(raw_qty) else 1
+                                qty = max(1, qty)
+                            except Exception:
+                                qty = 1
+
                             rush_val = str(row.get("是否夜衝", row.get("night_rush", "否"))).strip().lower()
                             night_rush = rush_val in ["是", "true", "1", "yes", "y"]
 
-                            v_count = int(row.get("來過次數", row.get("visit_count", 1)))
+                            # 來訪次數
+                            raw_v = row.get("來過次數", row.get("visit_count", 1))
+                            try:
+                                v_count = int(float(raw_v)) if not pd.isna(raw_v) else 1
+                                v_count = max(1, v_count)
+                            except Exception:
+                                v_count = 1
+
                             tag = str(row.get("客戶標籤", row.get("tag", "一般"))).strip()
                             if tag not in CUSTOMER_TAGS:
                                 tag = "一般"
+
                             notes = str(row.get("空白文字備註", row.get("notes", ""))).strip()
-                            if notes == "nan":
+                            if notes.lower() in ["nan", "none", "null"]:
                                 notes = ""
 
                             if not name or not phone:
@@ -1180,7 +1258,7 @@ def render_import_export_view():
                                 error_logs.append(f"第 {idx+1} 列：缺少姓名或電話，略過。")
                                 continue
 
-                            # 自動計算費用與代碼
+                            # 自動計算費用與訂單編號
                             calc_total, _, _, _ = calculate_booking_fee(area, qty, check_in, check_out, night_rush)
                             b_code = generate_booking_code(check_in) + f"-{idx}"
 
