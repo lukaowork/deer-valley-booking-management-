@@ -246,25 +246,31 @@ def calculate_booking_fee(
 ) -> Tuple[int, int, int, int]:
     """
     計算營位訂位費用：
-    - 正常營位費用 = 預約帳數 * 單價 * 住宿天數
-    - 夜衝費用 = 實際夜衝帳數 * (單價 * 0.5)
-    - 總金額 = 正常營位費用 + 夜衝費用
+    - 支援多區域字串解析 (如 "草地區 (2 帳)、通鋪房間 (1 間)")
+    - 正常營位費用 = 各區域預約數量 * 單價 * 住宿天數
+    - 夜衝費用 = 各區域夜衝數量 * (單價 * 0.5)
     回傳: (總金額, 住宿晚數, 正常營位費用, 夜衝費用)
     """
-    if area not in CAMP_AREAS:
-        return (0, 1, 0, 0)
-
-    area_info = CAMP_AREAS[area]
-    price_per_night = area_info["price_per_night"]
-    night_rush_unit_price = int(price_per_night * 0.5)
-
+    area_dict = parse_area_quantities(str(area), int(quantity))
     nights = max(1, (check_out - check_in).days)
-    base_fee = price_per_night * quantity * nights
-    # 夜衝帳數限制：不超過預約總帳數，且至少為 0
-    actual_rush_qty = max(0, min(quantity, int(night_rush_qty)))
-    night_rush_fee = night_rush_unit_price * actual_rush_qty
+    
+    base_fee = 0
+    night_rush_fee = 0
+    rush_remaining = int(night_rush_qty)
+    
+    # 計算基礎費用與夜衝費用分配
+    for area_name, qty in area_dict.items():
+        if area_name in CAMP_AREAS and qty > 0:
+            price = CAMP_AREAS[area_name]["price_per_night"]
+            base_fee += price * qty * nights
+            
+            # 若有夜衝總額度，依序套用於各區域直至額度耗盡
+            apply_rush = max(0, min(qty, rush_remaining))
+            if apply_rush > 0:
+                night_rush_fee += int(price * 0.5) * apply_rush
+                rush_remaining -= apply_rush
+                
     total_fee = base_fee + night_rush_fee
-
     return (total_fee, nights, base_fee, night_rush_fee)
 
 
@@ -298,9 +304,25 @@ POPULAR_HOLIDAYS: List[Tuple[str, date]] = [
 ]
 
 
+def parse_area_quantities(area_str: str, total_qty: int = 1) -> Dict[str, int]:
+    """解析複合區域字串，回傳各區域的帳數字典"""
+    import re
+    res = {}
+    if "(" in area_str:
+        for k in CAMP_AREAS.keys():
+            m = re.search(re.escape(k) + r"\s*\(\s*(\d+)", area_str)
+            if m:
+                res[k] = int(m.group(1))
+    else:
+        if area_str in CAMP_AREAS:
+            res[area_str] = int(total_qty)
+    return res
+
+
 def is_shelter_group_booking(area: str, quantity: int) -> bool:
     """判斷是否為雨棚區包區 (雨棚區且預約數量 >= 6)"""
-    return area == "雨棚區" and int(quantity) >= 6
+    parsed = parse_area_quantities(str(area), int(quantity))
+    return parsed.get("雨棚區", 0) >= 6
 
 
 @st.cache_data(ttl=600)
@@ -325,15 +347,21 @@ def get_dashboard_campsite_slots(target_date_str: str) -> Dict[str, Any]:
     for area_name, area_info in CAMP_AREAS.items():
         capacity = area_info["capacity"]
         unit = area_info["unit"]
-        area_df = df[df["area"] == area_name]
-        area_bookings = area_df.to_dict("records")
+        
+        area_bookings = []
+        for _, row in df.iterrows():
+            parsed = parse_area_quantities(str(row.get("area", "")), int(row.get("quantity", 1)))
+            if parsed.get(area_name, 0) > 0:
+                b_copy = dict(row)
+                b_copy["qty_for_this_area"] = parsed[area_name]
+                area_bookings.append(b_copy)
 
         # 檢測是否有雨棚包區訂單
         has_shelter_group = False
         group_booking_ref = None
         if area_name == "雨棚區":
             for b in area_bookings:
-                if is_shelter_group_booking(b.get("area", ""), b.get("quantity", 0)):
+                if is_shelter_group_booking(str(b.get("area", "")), int(b.get("quantity", 0))):
                     has_shelter_group = True
                     group_booking_ref = b
                     shelter_group_info = b
@@ -342,12 +370,14 @@ def get_dashboard_campsite_slots(target_date_str: str) -> Dict[str, Any]:
         slots: List[Dict[str, Any]] = []
         slot_idx = 1
         for b in area_bookings:
-            qty = int(b.get("quantity", 1))
+            qty = b["qty_for_this_area"]
+            # 若勾選夜衝，則此訂單全額享有夜衝標籤 (依 checkbox 判定)
+            # 相容舊資料：若有 night_rush_quantity，則也納入判定
             rush_qty = int(b.get("night_rush_quantity", 1 if b.get("night_rush") else 0))
-            is_group = is_shelter_group_booking(b.get("area", ""), qty)
+            is_group = is_shelter_group_booking(str(b.get("area", "")), int(b.get("quantity", 1)))
             for i in range(qty):
                 if slot_idx <= capacity:
-                    has_night_rush = (i < rush_qty) or (b.get("night_rush") == 1 and rush_qty > 0)
+                    has_night_rush = (b.get("night_rush") == 1) or (rush_qty > 0)
                     slots.append({
                         "slot_no": slot_idx,
                         "status": "booked",
@@ -420,13 +450,18 @@ def get_dashboard_summary(selected_date_str: str) -> Tuple[Dict[str, int], pd.Da
     """查詢選定日期各區域佔用數量、當日入住名單、當日退房名單 - 快取 600 秒"""
     conn = get_db_connection()
     query_occ = """
-        SELECT area, SUM(quantity) as booked_units, COUNT(*) as booking_count
+        SELECT area, quantity
         FROM bookings
         WHERE ? >= check_in_date AND ? < check_out_date
-        GROUP BY area
     """
     df_occupied = pd.read_sql_query(query_occ, conn, params=(selected_date_str, selected_date_str))
-    occupied_map = {row["area"]: row["booked_units"] for _, row in df_occupied.iterrows()}
+    
+    occupied_map = {"雨棚區": 0, "草地區": 0, "通舖房間": 0}
+    for _, row in df_occupied.iterrows():
+        parsed = parse_area_quantities(str(row["area"]), int(row["quantity"]))
+        for k, v in parsed.items():
+            if k in occupied_map:
+                occupied_map[k] += v
 
     df_in = pd.read_sql_query(
         "SELECT booking_code as '訂單編號', name as '姓名', phone as '電話', area as '區域', quantity as '數量', night_rush as '夜衝', tag as '標籤' FROM bookings WHERE check_in_date = ?",
@@ -1001,7 +1036,7 @@ def render_dashboard_view():
                         </div>
                     </div>
                     <div style="margin-top:10px; font-size:0.92rem; color:#333; display:flex; flex-wrap:wrap; gap:16px;">
-                        <div>🏕️ <b>區域</b>：{row['area']} ({row['quantity']} {area_unit}) {'(滿 6 帳包區)' if is_group_shelter else ''}</div>
+                        <div>🏕️ <b>區域</b>：{row['area']} {'(滿 6 帳包區)' if is_group_shelter else ''}</div>
                         <div>📅 <b>入住~退房</b>：{row['check_in_date']} 至 {row['check_out_date']}</div>
                         <div>⚡ <b>夜衝</b>：{f'是 ({rush_num} {area_unit})' if has_rush_flag else '否'}</div>
                         <div>🔖 <b>訂單號</b>：<code>{row['booking_code']}</code></div>
@@ -1220,7 +1255,7 @@ def render_bookings_view():
                                 </div>
                             </div>
                             <div style="margin-top:10px; font-size:0.92rem; color:#333; display:flex; flex-wrap:wrap; gap:16px;">
-                                <div>🏕️ <b>區域</b>：{row['area']} ({row['quantity']} {area_unit}) {'(滿 6 帳包區)' if is_group_shelter else ''}</div>
+                                <div>🏕️ <b>區域</b>：{row['area']} {'(滿 6 帳包區)' if is_group_shelter else ''}</div>
                                 <div>📅 <b>入住~退房</b>：{row['check_in_date']} 至 {row['check_out_date']}</div>
                                 <div>⚡ <b>夜衝</b>：{f'是 ({rush_num} {area_unit})' if has_rush_flag else '否'}</div>
                                 <div>🔖 <b>訂單號</b>：<code>{row['booking_code']}</code></div>
@@ -1347,33 +1382,19 @@ def render_booking_form_view():
             )
 
         st.markdown("---")
-        st.markdown("#### 2. 營位預訂細節與日期")
+        st.markdown("#### 2. 營位預訂細節與日期 (支援跨區複選)")
 
-        col_b1, col_b2, col_b3 = st.columns([1.2, 1, 1])
+        col_b1, col_b2, col_b3 = st.columns(3)
+        parsed_defaults = parse_area_quantities(default_area, default_quantity)
+        
         with col_b1:
-            area_val = st.selectbox(
-                "預約區域 *",
-                options=list(CAMP_AREAS.keys()),
-                index=list(CAMP_AREAS.keys()).index(default_area),
-            )
+            qty_shelter = st.number_input("雨棚區 (帳數)", min_value=0, max_value=8, value=min(8, parsed_defaults.get("雨棚區", 0)))
         with col_b2:
-            max_cap = CAMP_AREAS[area_val]["capacity"]
-            unit_str = CAMP_AREAS[area_val]["unit"]
-            quantity_val = st.number_input(
-                f"預約總數量 ({unit_str}) *",
-                min_value=1,
-                max_value=max_cap,
-                value=min(default_quantity, max_cap),
-            )
+            qty_grass = st.number_input("草地區 (帳數)", min_value=0, max_value=4, value=min(4, parsed_defaults.get("草地區", 0)))
         with col_b3:
-            default_rush_qty = int(booking_data.get("night_rush_quantity", 1 if default_night_rush else 0)) if is_editing else 0
-            night_rush_qty_val = st.number_input(
-                f"⚡ 夜衝數量 ({unit_str})",
-                min_value=0,
-                max_value=int(quantity_val),
-                value=min(default_rush_qty, int(quantity_val)),
-                help="彈性夜衝帳數/間數（前晚 18:00–23:00 入場）。每帳/間按原價之 50% 獨立計費。若無夜衝請設為 0。",
-            )
+            qty_room = st.number_input("通舖房間 (間數)", min_value=0, max_value=2, value=min(2, parsed_defaults.get("通舖房間", 0)))
+
+        has_night_rush = st.checkbox("⚡ 包含前晚夜衝 (全預約營位皆享 50% 夜衝折扣)", value=default_night_rush)
 
         col_d1, col_d2 = st.columns(2)
         with col_d1:
@@ -1381,23 +1402,31 @@ def render_booking_form_view():
         with col_d2:
             check_out_val = st.date_input("預計退房日期 *", value=default_check_out)
 
-        if area_val == "雨棚區" and quantity_val >= 6:
-            st.info("🏷️ **雨棚區包區提示**：預約數量達 6 帳以上，系統自動認定為【雨棚區包區】，營位總覽看板將連動保留雨棚區 1~8 號全區！")
+        total_qty = qty_shelter + qty_grass + qty_room
+        area_parts = []
+        if qty_shelter > 0: area_parts.append(f"雨棚區 ({qty_shelter} 帳)")
+        if qty_grass > 0: area_parts.append(f"草地區 ({qty_grass} 帳)")
+        if qty_room > 0: area_parts.append(f"通舖房間 ({qty_room} 間)")
+        area_val = "、".join(area_parts) if area_parts else "未選擇"
+        
+        if qty_shelter >= 6:
+            st.info("🏷️ **雨棚區包區提示**：雨棚預約達 6 帳以上，系統自動認定為【雨棚區包區】，營位總覽看板將連動保留雨棚區 1~8 號全區！")
 
         notes_val = st.text_area("空白文字備註 (特殊需求、車牌、同團成員等)", value=default_notes, placeholder="請在此自由填寫備註...")
 
-        # 即時費用計算 (夜衝帳數獨立計費)
+        # 即時費用計算
+        night_rush_qty_val = total_qty if has_night_rush else 0
         calc_total, nights_count, base_fee, rush_fee = calculate_booking_fee(
-            area_val, quantity_val, check_in_val, check_out_val, night_rush_qty_val
+            area_val, total_qty, check_in_val, check_out_val, night_rush_qty_val
         )
 
         st.markdown("---")
         st.markdown("#### 3. 預估費用計算明細")
         f_col1, f_col2, f_col3, f_col4 = st.columns(4)
         f_col1.metric("預計住宿晚數", f"{nights_count} 晚")
-        f_col2.metric("營位基礎費用", f"NT$ {base_fee:,}", f"{quantity_val} {unit_str}")
-        f_col3.metric("夜衝費用 (50%)", f"NT$ {rush_fee:,}", f"{night_rush_qty_val} {unit_str} 夜衝" if night_rush_qty_val > 0 else "無夜衝")
-        f_col4.metric("應收總金額", f"NT$ {calc_total:,}", delta="含車位規格")
+        f_col2.metric("營位基礎費用", f"NT$ {base_fee:,}", f"共 {total_qty} 單位")
+        f_col3.metric("夜衝費用 (50%)", f"NT$ {rush_fee:,}", "包含夜衝" if has_night_rush else "無夜衝")
+        f_col4.metric("應收總金額", f"NT$ {calc_total:,}", delta="含跨區組合" if len(area_parts) > 1 else "")
 
         submit_btn = st.form_submit_button(
             "💾 儲存並建立訂單" if not is_editing else "💾 儲存修改內容",
@@ -1411,12 +1440,14 @@ def render_booking_form_view():
                 st.error("請填寫露營人姓名！")
             elif not phone_val.strip():
                 st.error("請填寫露營人電話！")
+            elif total_qty == 0:
+                st.error("請至少選擇一個區域並輸入數量！")
             elif check_out_val <= check_in_val:
                 st.error("退房日期必須在入住日期之後！")
             else:
                 current_user = st.session_state.get("authenticated_user", "管理員")
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                has_night_rush = 1 if night_rush_qty_val > 0 else 0
+                has_night_rush = 1 if has_night_rush else 0
 
                 conn = get_db_connection()
                 cursor = conn.cursor()
@@ -1438,7 +1469,7 @@ def render_booking_form_view():
                                 name_val.strip(),
                                 phone_val.strip(),
                                 area_val,
-                                quantity_val,
+                                total_qty,
                                 has_night_rush,
                                 int(night_rush_qty_val),
                                 visit_count_val,
@@ -1454,7 +1485,7 @@ def render_booking_form_view():
                         add_audit_log(
                             current_user,
                             "修改訂單",
-                            f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val} {quantity_val}{unit_str}, 夜衝: {night_rush_qty_val}{unit_str}, 總額: {calc_total})",
+                            f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {night_rush_qty_val}, 總額: {calc_total})",
                         )
                         st.session_state["editing_booking_id"] = None
                         st.session_state["editing_booking_data"] = None
@@ -1477,7 +1508,7 @@ def render_booking_form_view():
                                 name_val.strip(),
                                 phone_val.strip(),
                                 area_val,
-                                quantity_val,
+                                total_qty,
                                 has_night_rush,
                                 int(night_rush_qty_val),
                                 visit_count_val,
