@@ -976,8 +976,12 @@ def render_dashboard_view():
                 for _, row in daily_df.iterrows():
                     area = row["area"]
                     qty = int(row["quantity"])
-                    if area in summary:
-                        summary[area] += qty
+                    # 解析跨區複合區域字串 (如 "雨棚區 (2 帳)、草地區 (1 帳)")
+                    # 確保各區域狀態點點 (雨棚/草地/通鋪) 都能正確累加顯示
+                    parsed_areas = parse_area_quantities(str(area), qty)
+                    for area_name, area_qty in parsed_areas.items():
+                        if area_name in summary:
+                            summary[area_name] += area_qty
                     if is_shelter_group_booking(area, qty):
                         has_group = True
                     # 檢測當日是否為夜衝日 (即入住當日，且有夜衝帳數)
@@ -1024,11 +1028,12 @@ def render_dashboard_view():
                 if has_night_rush:
                     tags.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 10px; border-radius:999px; font-size:0.72rem; font-weight:700;">⚡ 夜衝</span>')
                 
-                tags_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px; min-height:22px;">{"".join(tags)}</div>'
-                badges_html = f'<div style="display:flex; flex-direction:column; gap:2px; margin-top:2px;">{"".join(badges)}</div>' if badges else '<div style="min-height:20px;"></div>'
+                # 狀態點點與膠囊標籤同時並存於同一行 (例：🟢 雨棚 x6 🏷️ 包區)
+                status_items = badges + tags
+                status_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; align-items:center; margin-top:4px; min-height:22px;">{"".join(status_items)}</div>' if status_items else '<div style="min-height:22px;"></div>'
                 
                 # 關閉格子容器 (所有自訂 HTML 均帶 unsafe_allow_html=True)
-                final_html = f'{badges_html}{tags_html}</div><div style="height:10px;"></div>'
+                final_html = f'{status_html}</div><div style="height:10px;"></div>'
                 st.markdown(final_html, unsafe_allow_html=True)
 
     # 3. 日期點擊與側邊/下方「訂單資料抽屜 (Drawer)」
@@ -1086,6 +1091,18 @@ def render_dashboard_view():
                 ' <span style="background:#FFF8E1; color:#F57F17; border:1px solid #FFE082; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem;">🏷️ 雨棚包區</span>'
                 if is_group_shelter else ""
             )
+            # 各區域狀態點點標籤 (🟢 雨棚 / 🟠 草地 / 🟣 通鋪)，與包區標籤同時並存顯示
+            card_area_qtys = parse_area_quantities(str(row.get("area", "")), int(row.get("quantity", 0)))
+            canopy_qty = card_area_qtys.get("雨棚區", 0)
+            grass_qty = card_area_qtys.get("草地區", 0)
+            room_qty = card_area_qtys.get("通舖房間", 0)
+            area_dot_badges = ""
+            if canopy_qty > 0:
+                area_dot_badges += f' <span style="background:#E8F5E9; color:#1B5E20; border:1px solid #A5D6A7; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem;">🟢 雨棚 x{canopy_qty}</span>'
+            if grass_qty > 0:
+                area_dot_badges += f' <span style="background:#FFF3E0; color:#E65100; border:1px solid #FFCC80; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem;">🟠 草地 x{grass_qty}</span>'
+            if room_qty > 0:
+                area_dot_badges += f' <span style="background:#F3E5F5; color:#6A1B9A; border:1px solid #CE93D8; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem;">🟣 通鋪 x{room_qty}</span>'
             
             card_html = (
                 f"""
@@ -1095,6 +1112,7 @@ def render_dashboard_view():
                             <span style="font-size:1.2rem; font-weight:700; color:#1B5E20;">{row['name']}</span>
                             <span style="font-size:0.95rem; color:#666; margin-left:12px;">📞 {row['phone']}</span>
                             <span style="{tag_style}; margin-left:10px;">{row['tag']}</span>
+                            {area_dot_badges}
                             {shelter_group_badge}
                         </div>
                         <div>
