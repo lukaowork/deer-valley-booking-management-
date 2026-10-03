@@ -185,6 +185,11 @@ def init_db():
         cursor.execute("ALTER TABLE bookings ADD COLUMN night_rush_quantity INTEGER DEFAULT 0")
     except Exception:
         pass
+        
+    try:
+        cursor.execute("ALTER TABLE bookings ADD COLUMN night_rush_detail TEXT DEFAULT ''")
+    except Exception:
+        pass
 
     # 舊資料庫相容：若 night_rush=1 且 night_rush_quantity 為 0，自動對齊為 quantity
     try:
@@ -242,7 +247,7 @@ def get_audit_logs(limit: int = 200) -> pd.DataFrame:
 # 3. 費用計算、週末連動與訂單邏輯輔助函式
 # ==============================================================================
 def calculate_booking_fee(
-    area: str, quantity: int, check_in: date, check_out: date, night_rush_qty: int = 0
+    area: str, quantity: int, check_in: date, check_out: date, night_rush_qty_str: str = ""
 ) -> Tuple[int, int, int, int]:
     """
     計算營位訂位費用：
@@ -252,11 +257,12 @@ def calculate_booking_fee(
     回傳: (總金額, 住宿晚數, 正常營位費用, 夜衝費用)
     """
     area_dict = parse_area_quantities(str(area), int(quantity))
+    rush_dict = parse_area_quantities(str(night_rush_qty_str), 0) if isinstance(night_rush_qty_str, str) else parse_area_quantities("", int(night_rush_qty_str))
+    
     nights = max(1, (check_out - check_in).days)
     
     base_fee = 0
     night_rush_fee = 0
-    rush_remaining = int(night_rush_qty)
     
     # 計算基礎費用與夜衝費用分配
     for area_name, qty in area_dict.items():
@@ -264,11 +270,10 @@ def calculate_booking_fee(
             price = CAMP_AREAS[area_name]["price_per_night"]
             base_fee += price * qty * nights
             
-            # 若有夜衝總額度，依序套用於各區域直至額度耗盡
-            apply_rush = max(0, min(qty, rush_remaining))
+            # 使用獨立的夜衝數量
+            apply_rush = max(0, min(qty, rush_dict.get(area_name, 0)))
             if apply_rush > 0:
                 night_rush_fee += int(price * 0.5) * apply_rush
-                rush_remaining -= apply_rush
                 
     total_fee = base_fee + night_rush_fee
     return (total_fee, nights, base_fee, night_rush_fee)
@@ -869,6 +874,17 @@ def render_dashboard_view():
     if "dash_calendar_base" not in st.session_state:
         st.session_state["dash_calendar_base"] = date.today()
 
+    # 當月月份醒目顯示 (Prominent Month Display)
+    base_dt = st.session_state["dash_calendar_base"]
+    st.markdown(
+        f"""
+        <div style="background: linear-gradient(135deg, #1B5E20, #2E7D32); color: white; padding: 16px 24px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(46, 125, 50, 0.2); text-align: center;">
+            <span style="font-size: 1.8rem; font-weight: 800; letter-spacing: 2px;">📅 {base_dt.year} 年 {base_dt.month} 月</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     # 視角切換器與快捷跳轉按鈕工具列 (全面同步 session_state)
     b_col1, b_col2, b_col3 = st.columns([1.5, 3, 1.5])
     with b_col1:
@@ -1000,8 +1016,37 @@ def render_dashboard_view():
     # 3. 日期點擊與側邊/下方「訂單資料抽屜 (Drawer)」
     selected_dt = st.session_state["dashboard_selected_date"]
     st.markdown("---")
-    st.markdown(f"#### 📝 {selected_dt.strftime('%Y-%m-%d')} 訂位明細抽屜")
     
+    drawer_col1, drawer_col2 = st.columns([1, 1])
+    with drawer_col1:
+        st.markdown(f"#### 📝 {selected_dt.strftime('%Y-%m-%d')} 訂位明細抽屜")
+    with drawer_col2:
+        if st.button(f"➕ 快速新增 {selected_dt.strftime('%m/%d')} 露營預約", use_container_width=True, type="primary"):
+            st.session_state["show_quick_booking_form"] = True
+            st.session_state["quick_booking_date"] = selected_dt
+            st.session_state["editing_booking_id"] = None
+            st.session_state["editing_booking_data"] = None
+            st.rerun()
+            
+    if st.session_state.get("show_quick_booking_form", False):
+        st.markdown(
+            """
+            <div style="padding: 16px; border: 2px solid #2E7D32; border-radius: 12px; background: #F1F8E9; margin-bottom: 20px;">
+                <h4 style="color: #1B5E20; margin-top:0;">🚀 快速新增預約</h4>
+            """,
+            unsafe_allow_html=True,
+        )
+        # 覆蓋按鈕與表單的行為，讓其在提交後關閉並重整
+        if st.button("❌ 取消並收起快速新增表單", key="cancel_quick_booking"):
+            st.session_state["show_quick_booking_form"] = False
+            st.rerun()
+            
+        # 呼叫表單模組渲染 (需確保表單內的跳轉不會覆蓋)
+        render_booking_form_view(is_quick_mode=True)
+        
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("---")
+        
     mask_selected = (pd.to_datetime(df_all["check_in_date"]).dt.date <= selected_dt) & (pd.to_datetime(df_all["check_out_date"]).dt.date > selected_dt)
     df_selected = df_all[mask_selected]
     
@@ -1304,7 +1349,7 @@ def render_bookings_view():
 # ==============================================================================
 # 9. 頁面功能：新增與編輯預約 (Booking Form)
 # ==============================================================================
-def render_booking_form_view():
+def render_booking_form_view(is_quick_mode: bool = False):
     editing_id = st.session_state.get("editing_booking_id", None)
     is_editing = editing_id is not None
 
@@ -1326,7 +1371,8 @@ def render_booking_form_view():
                 st.session_state["editing_booking_data"] = None
                 is_editing = False
 
-    st.markdown(f"### {'✏️ 編輯露營訂位資料' if is_editing else '➕ 新增露營客預約訂單'}")
+    if not is_quick_mode:
+        st.markdown(f"### {'✏️ 編輯露營訂位資料' if is_editing else '➕ 新增露營客預約訂單'}")
 
     if is_editing and booking_data:
         st.info(f"正在編輯訂單：**{booking_data['booking_code']}** (露營客: {booking_data['name']})")
@@ -1338,9 +1384,7 @@ def render_booking_form_view():
     # 預設值設定
     default_name = booking_data["name"] if is_editing else ""
     default_phone = booking_data["phone"] if is_editing else ""
-    default_area = booking_data["area"] if is_editing else "雨棚區"
-    default_quantity = booking_data["quantity"] if is_editing else 1
-    default_night_rush = bool(booking_data["night_rush"]) if is_editing else False
+    default_area = booking_data["area"] if is_editing else ""
     default_tag = booking_data["tag"] if is_editing else "一般"
     default_notes = booking_data["notes"] if is_editing else ""
     default_visit_count = booking_data["visit_count"] if is_editing else 1
@@ -1349,7 +1393,11 @@ def render_booking_form_view():
         default_check_in = datetime.strptime(booking_data["check_in_date"], "%Y-%m-%d").date()
         default_check_out = datetime.strptime(booking_data["check_out_date"], "%Y-%m-%d").date()
     else:
-        default_check_in = date.today() + timedelta(days=1)
+        if "quick_booking_date" in st.session_state and st.session_state["quick_booking_date"]:
+            default_check_in = st.session_state["quick_booking_date"]
+            st.session_state["quick_booking_date"] = None
+        else:
+            default_check_in = date.today() + timedelta(days=1)
         default_check_out = default_check_in + timedelta(days=1)
 
     with st.form("booking_editor_form"):
@@ -1490,6 +1538,10 @@ def render_booking_form_view():
                         st.session_state["editing_booking_id"] = None
                         st.session_state["editing_booking_data"] = None
                         st.success(f"訂單 {booking_data['booking_code']} 修改成功！")
+                        
+                        if is_quick_mode:
+                            st.session_state["show_quick_booking_form"] = False
+                            st.rerun()
                     else:
                         # 新增訂單
                         b_code = generate_booking_code(check_in_val)
@@ -1497,9 +1549,9 @@ def render_booking_form_view():
                             """
                             INSERT INTO bookings (
                                 booking_code, check_in_date, check_out_date, name, phone,
-                                area, quantity, night_rush, night_rush_quantity, visit_count, tag, notes,
+                                area, quantity, night_rush, night_rush_quantity, night_rush_detail, visit_count, tag, notes,
                                 total_amount, created_by, created_at, updated_at
-                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """,
                             (
                                 b_code,
@@ -1511,6 +1563,7 @@ def render_booking_form_view():
                                 total_qty,
                                 has_night_rush,
                                 int(night_rush_qty_val),
+                                rush_val,
                                 visit_count_val,
                                 tag_val,
                                 notes_val.strip(),
@@ -1525,9 +1578,13 @@ def render_booking_form_view():
                         add_audit_log(
                             current_user,
                             "新增訂單",
-                            f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val} {quantity_val}{unit_str}, 夜衝: {night_rush_qty_val}{unit_str}, 入住: {check_in_val}, 金額: {calc_total})",
+                            f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {night_rush_qty_val}, 入住: {check_in_val}, 金額: {calc_total})",
                         )
                         st.success(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}")
+                        
+                        if is_quick_mode:
+                            st.session_state["show_quick_booking_form"] = False
+                            st.rerun()
 
                     conn.close()
                     # 觸發雲端與本地自動同步備份
