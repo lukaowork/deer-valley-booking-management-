@@ -1044,6 +1044,8 @@ def render_dashboard_view():
             st.session_state["quick_booking_date"] = selected_dt
             st.session_state["editing_booking_id"] = None
             st.session_state["editing_booking_data"] = None
+            # 重置表單日期鍵值，確保快速新增帶入點選日期與隔天退房
+            reset_booking_form_date_keys()
             st.rerun()
             
     if st.session_state.get("show_quick_booking_form", False):
@@ -1057,6 +1059,7 @@ def render_dashboard_view():
         # 覆蓋按鈕與表單的行為，讓其在提交後關閉並重整
         if st.button("❌ 取消並收起快速新增表單", key="cancel_quick_booking"):
             st.session_state["show_quick_booking_form"] = False
+            reset_booking_form_date_keys()
             st.rerun()
             
         # 呼叫表單模組渲染 (需確保表單內的跳轉不會覆蓋)
@@ -1121,6 +1124,7 @@ def render_dashboard_view():
                     st.session_state["editing_booking_id"] = row["id"]
                     st.session_state["editing_booking_data"] = dict(row)
                     st.session_state["jump_to_page"] = "➕ 新增露營預約"
+                    reset_booking_form_date_keys()
                     st.rerun()
             with btn_c2:
                 with st.popover("🗑️ 刪除", use_container_width=True):
@@ -1339,6 +1343,7 @@ def render_bookings_view():
                             st.session_state["editing_booking_id"] = row["id"]
                             st.session_state["editing_booking_data"] = dict(row)
                             st.session_state["jump_to_page"] = "➕ 新增露營預約"
+                            reset_booking_form_date_keys()
                             st.rerun()
                     with btn_c2:
                         with st.popover("🗑️ 刪除"):
@@ -1367,6 +1372,18 @@ def render_bookings_view():
 # ==============================================================================
 # 9. 頁面功能：新增與編輯預約 (Booking Form)
 # ==============================================================================
+# 表單入住/退房日期連動所使用的 session_state 鍵值
+FORM_CHECK_IN_KEY = "booking_form_check_in_date"
+FORM_CHECK_OUT_KEY = "booking_form_check_out_date"
+FORM_PREV_CHECK_IN_KEY = "booking_form_prev_check_in"
+
+
+def reset_booking_form_date_keys():
+    """重置表單日期鍵值，讓表單下次渲染時正確帶入預設的入住/退房日期"""
+    for _dk in (FORM_CHECK_IN_KEY, FORM_CHECK_OUT_KEY, FORM_PREV_CHECK_IN_KEY):
+        st.session_state.pop(_dk, None)
+
+
 def render_booking_form_view(is_quick_mode: bool = False):
     editing_id = st.session_state.get("editing_booking_id", None)
     is_editing = editing_id is not None
@@ -1387,6 +1404,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 st.warning("找不到該筆編輯訂單，已切換回新增模式。")
                 st.session_state["editing_booking_id"] = None
                 st.session_state["editing_booking_data"] = None
+                reset_booking_form_date_keys()
                 is_editing = False
 
     if not is_quick_mode:
@@ -1397,6 +1415,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
         if st.button("⬅️ 取消編輯，切換回新增預約模式"):
             st.session_state["editing_booking_id"] = None
             st.session_state["editing_booking_data"] = None
+            reset_booking_form_date_keys()
             st.rerun()
 
     # 預設值設定
@@ -1520,9 +1539,34 @@ def render_booking_form_view(is_quick_mode: bool = False):
 
         col_d1, col_d2 = st.columns(2)
         with col_d1:
-            check_in_val = st.date_input("主要入住日期 *", value=default_check_in)
+            check_in_val = st.date_input(
+                "主要入住日期 *",
+                value=default_check_in,
+                key=FORM_CHECK_IN_KEY,
+            )
+
+        # 入住日期變更偵測：自動連動退房日期為入住日 +1 天
+        # (若退房日仍為舊入住日 +1、或尚未手動修改、或已早於新入住日，則自動帶入隔天)
+        # 使用者仍可手動選擇多天後的退房日期 (如 3 天 2 夜)
+        prev_check_in = st.session_state.get(FORM_PREV_CHECK_IN_KEY, None)
+        if prev_check_in is not None and check_in_val != prev_check_in:
+            old_auto_check_out = prev_check_in + timedelta(days=1)
+            current_check_out = st.session_state.get(FORM_CHECK_OUT_KEY, None)
+            if (
+                current_check_out == old_auto_check_out
+                or current_check_out is None
+                or current_check_out <= check_in_val
+            ):
+                st.session_state[FORM_CHECK_OUT_KEY] = check_in_val + timedelta(days=1)
+        st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in_val
+
         with col_d2:
-            check_out_val = st.date_input("預計退房日期 *", value=default_check_out)
+            check_out_val = st.date_input(
+                "預計退房日期 *",
+                value=default_check_out,
+                min_value=check_in_val + timedelta(days=1),
+                key=FORM_CHECK_OUT_KEY,
+            )
 
         total_qty = qty_shelter + qty_grass + qty_room
         area_parts = []
@@ -1623,6 +1667,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         )
                         st.session_state["editing_booking_id"] = None
                         st.session_state["editing_booking_data"] = None
+                        reset_booking_form_date_keys()
                         st.success(f"訂單 {booking_data['booking_code']} 修改成功！")
                         
                         if is_quick_mode:
@@ -1667,6 +1712,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                             f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 入住: {check_in_val}, 金額: {calc_total})",
                         )
                         st.success(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}")
+                        reset_booking_form_date_keys()
                         
                         if is_quick_mode:
                             st.session_state["show_quick_booking_form"] = False
@@ -2225,6 +2271,7 @@ def main():
         st.session_state["authenticated_pin"] = None
         st.session_state["editing_booking_id"] = None
         st.session_state["editing_booking_data"] = None
+        reset_booking_form_date_keys()
         st.session_state["timeout_logged_out"] = True
         st.rerun()
 
@@ -2311,6 +2358,7 @@ def main():
             st.session_state["authenticated_pin"] = None
             st.session_state["editing_booking_id"] = None
             st.session_state["editing_booking_data"] = None
+            reset_booking_form_date_keys()
             st.rerun()
 
     # 路由渲染對應頁面
