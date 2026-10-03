@@ -1695,11 +1695,11 @@ def render_import_export_view():
                     for idx, row in df_upload.iterrows():
                         try:
                             # 姓名與電話解析
-                            name = str(row.get("露營人姓名", row.get("name", ""))).strip()
-                            if name.lower() == "nan":
+                            name = str(row.get("露營人姓名", row.get("name", row.get("姓名", "")))).strip()
+                            if name.lower() in ["nan", "none", "null"]:
                                 name = ""
 
-                            raw_phone = row.get(phone_col) if phone_col else row.get("露營人電話", row.get("phone", ""))
+                            raw_phone = row.get(phone_col) if phone_col else row.get("露營人電話", row.get("phone", row.get("電話", "")))
                             phone = format_phone_number(raw_phone)
 
                             # 預約區域解析
@@ -1707,28 +1707,34 @@ def render_import_export_view():
                             if area not in CAMP_AREAS:
                                 area = "雨棚區"
 
-                            # 日期安全解析 (確保絕不丟出 ValueError)
+                            # 日期安全解析 (確保絕不丟出 ValueError，允許無日期)
                             in_raw = str(row.get(in_col, "") if in_col else row.get("主要入住日期", row.get("check_in_date", ""))).strip()
-                            try:
-                                if in_raw and in_raw.lower() != "nan":
-                                    check_in = datetime.strptime(in_raw[:10], "%Y-%m-%d").date()
-                                else:
-                                    check_in = date.today()
-                            except Exception:
-                                check_in = date.today()
+                            check_in_str = "歷史客戶/無預約日期"
+                            check_out_str = "歷史客戶/無預約日期"
+                            is_valid_date = False
+                            
+                            if in_raw and in_raw.lower() not in ["nan", "none", "null", "nat"]:
+                                try:
+                                    check_in_dt = datetime.strptime(in_raw[:10], "%Y-%m-%d").date()
+                                    check_in_str = check_in_dt.strftime("%Y-%m-%d")
+                                    is_valid_date = True
+                                except Exception:
+                                    pass
 
                             out_raw = str(row.get(out_col, "") if out_col else row.get("退房日期", row.get("check_out_date", ""))).strip()
-                            try:
-                                if out_raw and out_raw.lower() != "nan":
-                                    check_out = datetime.strptime(out_raw[:10], "%Y-%m-%d").date()
+                            if is_valid_date:
+                                if out_raw and out_raw.lower() not in ["nan", "none", "null", "nat"]:
+                                    try:
+                                        check_out_dt = datetime.strptime(out_raw[:10], "%Y-%m-%d").date()
+                                        if check_out_dt <= check_in_dt:
+                                            check_out_dt = check_in_dt + timedelta(days=1)
+                                        check_out_str = check_out_dt.strftime("%Y-%m-%d")
+                                    except Exception:
+                                        check_out_dt = check_in_dt + timedelta(days=1)
+                                        check_out_str = check_out_dt.strftime("%Y-%m-%d")
                                 else:
-                                    check_out = check_in + timedelta(days=1)
-                            except Exception:
-                                check_out = check_in + timedelta(days=1)
-
-                            # 若退房日期早於或等於入住日期，自動修正為入住隔天
-                            if check_out <= check_in:
-                                check_out = check_in + timedelta(days=1)
+                                    check_out_dt = check_in_dt + timedelta(days=1)
+                                    check_out_str = check_out_dt.strftime("%Y-%m-%d")
 
                             # 數量解析
                             raw_qty = row.get("帳數/間數", row.get("quantity", 1))
@@ -1765,9 +1771,18 @@ def render_import_export_view():
                             if tag not in CUSTOMER_TAGS:
                                 tag = "一般"
 
-                            notes = str(row.get("空白文字備註", row.get("notes", ""))).strip()
-                            if notes.lower() in ["nan", "none", "null"]:
-                                notes = ""
+                            # 備註整合邏輯 (合併 "地區", "注意", "車宿", "寵物", "其他")
+                            notes_parts = []
+                            for col_name in ["地區", "注意", "車宿", "寵物", "其他"]:
+                                val = str(row.get(col_name, "")).strip()
+                                if val and val.lower() not in ["nan", "none", "null"]:
+                                    notes_parts.append(f"{col_name}: {val}")
+                            
+                            base_notes = str(row.get("空白文字備註", row.get("notes", ""))).strip()
+                            if base_notes and base_notes.lower() not in ["nan", "none", "null"]:
+                                notes_parts.insert(0, base_notes)
+                            
+                            notes = " | ".join(notes_parts)
 
                             if not name or not phone:
                                 skip_count += 1
@@ -1775,8 +1790,12 @@ def render_import_export_view():
                                 continue
 
                             # 自動計算費用與訂單編號 (夜衝帳數獨立計費)
-                            calc_total, _, _, _ = calculate_booking_fee(area, qty, check_in, check_out, rush_qty)
-                            b_code = generate_booking_code(check_in) + f"-{idx}"
+                            if is_valid_date:
+                                calc_total, _, _, _ = calculate_booking_fee(area, qty, check_in_dt, check_out_dt, rush_qty)
+                                b_code = generate_booking_code(check_in_dt) + f"-{idx}"
+                            else:
+                                calc_total, _, _, _ = calculate_booking_fee(area, qty, date.today(), date.today() + timedelta(days=1), rush_qty)
+                                b_code = f"LY-HISTORY-{datetime.now().strftime('%Y%m%d%H%M%S')}-{idx}"
 
                             cursor.execute(
                                 """
@@ -1788,8 +1807,8 @@ def render_import_export_view():
                                 """,
                                 (
                                     b_code,
-                                    check_in.strftime("%Y-%m-%d"),
-                                    check_out.strftime("%Y-%m-%d"),
+                                    check_in_str,
+                                    check_out_str,
                                     name,
                                     phone,
                                     area,
