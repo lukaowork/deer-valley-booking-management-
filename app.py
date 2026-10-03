@@ -462,22 +462,55 @@ class GoogleDriveSync:
             self.status_message = f"雲端連線嘗試失敗 (已平滑降級為本地儲存): {str(e)}"
 
     def upload_file_to_drive(self, file_content_bytes: bytes, file_name: str, mime_type: str) -> Tuple[bool, str]:
-        """上傳檔案至目標 Google Drive 資料夾"""
+        """
+        上傳檔案至目標 Google Drive 資料夾 (DVCG)，防範 Service Account 儲存配額錯誤 (HttpError 403)：
+        1. 明確在 file_metadata 中指定 parents=[self.folder_id]
+        2. 在 create 與 update 呼叫中均加入 supportsAllDrives=True
+        3. 若該備份檔名已存在於 DVCG 資料夾中，改呼叫 update 進行覆蓋更新
+        """
         if not self.is_connected or not self.service:
             return False, f"Google Drive 未連線：{self.status_message}"
 
         try:
             from googleapiclient.http import MediaIoBaseUpload
 
-            file_metadata = {
-                "name": file_name,
-                "parents": [self.folder_id],
-            }
             media = MediaIoBaseUpload(io.BytesIO(file_content_bytes), mimetype=mime_type, resumable=True)
 
-            file = self.service.files().create(body=file_metadata, media_body=media, fields="id, name, webViewLink").execute()
-            link = file.get("webViewLink", "")
-            return True, f"檔案成功備份至雲端！檔案 ID: {file.get('id')}，檔名: {file_name}"
+            # 1. 查詢目標 DVCG 資料夾中是否已存在同名檔案
+            escaped_name = file_name.replace("'", "\\'")
+            query = f"'{self.folder_id}' in parents and name = '{escaped_name}' and trashed = false"
+            response = self.service.files().list(
+                q=query,
+                spaces="drive",
+                fields="files(id, name, webViewLink)",
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            existing_files = response.get("files", [])
+
+            if existing_files:
+                # 2. 檔案已存在：改呼叫 update 進行更新，避免重複建立導致容量配額與權限問題
+                target_file_id = existing_files[0]["id"]
+                file = self.service.files().update(
+                    fileId=target_file_id,
+                    media_body=media,
+                    supportsAllDrives=True,
+                    fields="id, name, webViewLink",
+                ).execute()
+                return True, f"檔案已成功更新至雲端！檔案 ID: {file.get('id')}，檔名: {file_name}"
+            else:
+                # 3. 檔案不存在：執行 create 新建，明確指定 parents 與 supportsAllDrives=True
+                file_metadata = {
+                    "name": file_name,
+                    "parents": [self.folder_id],
+                }
+                file = self.service.files().create(
+                    body=file_metadata,
+                    media_body=media,
+                    supportsAllDrives=True,
+                    fields="id, name, webViewLink",
+                ).execute()
+                return True, f"檔案成功備份至雲端！檔案 ID: {file.get('id')}，檔名: {file_name}"
         except Exception as e:
             return False, f"上傳至 Google Drive 失敗: {str(e)}"
 
@@ -506,15 +539,16 @@ class GoogleDriveSync:
             with open(local_backup_path, "wb") as f:
                 f.write(excel_bytes)
 
-            # 嘗試 Google Drive 雲端同步
+            # 嘗試 Google Drive 雲端同步 (優先以「祿野營地資料庫最新備份.xlsx」常駐更新)
             if self.is_connected:
+                latest_cloud_filename = "祿野營地資料庫最新備份.xlsx"
                 success, msg = self.upload_file_to_drive(
                     excel_bytes,
-                    excel_filename,
+                    latest_cloud_filename,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
                 if success:
-                    add_audit_log(operator, "雲端同步備份", f"已成功同步至 Google Drive (DVCG 資料夾)：{excel_filename}")
+                    add_audit_log(operator, "雲端同步備份", f"已成功同步至 Google Drive (DVCG 資料夾)：{latest_cloud_filename}")
                     return True, f"雲端同步備份成功！本地亦已保存副本。\n{msg}"
                 else:
                     add_audit_log(operator, "雲端同步異常", f"雲端上傳失敗，已保存在本地備份：{local_backup_path}")
