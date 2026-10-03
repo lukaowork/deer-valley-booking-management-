@@ -33,6 +33,27 @@ SERVICE_ACCOUNT_PATH = os.path.join(DATA_DIR, "service_account.json")
 # Google Drive 預設目標資料夾 (DVCG)
 DEFAULT_GDRIVE_FOLDER_ID = "1JFzbSQuolGniXeAeeaX3okbUZPQ-Rzok"
 
+
+def get_gdrive_folder_id() -> str:
+    """取得 Google Drive 目標資料夾 ID (依序檢查 st.secrets, 環境變數, 預設常數)"""
+    try:
+        if hasattr(st, "secrets"):
+            if "gdrive_folder_id" in st.secrets:
+                return str(st.secrets["gdrive_folder_id"]).strip()
+            if "GDRIVE_FOLDER_ID" in st.secrets:
+                return str(st.secrets["GDRIVE_FOLDER_ID"]).strip()
+            if "FOLDER_ID" in st.secrets:
+                return str(st.secrets["FOLDER_ID"]).strip()
+            if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict) and "folder_id" in st.secrets["gcp_service_account"]:
+                return str(st.secrets["gcp_service_account"]["folder_id"]).strip()
+    except Exception:
+        pass
+    return os.environ.get("GDRIVE_FOLDER_ID", os.environ.get("FOLDER_ID", DEFAULT_GDRIVE_FOLDER_ID)).strip()
+
+
+# 全域 FOLDER_ID (供備份模組調用)
+FOLDER_ID = get_gdrive_folder_id()
+
 # 營區三大區域規格與費用設定
 CAMP_AREAS: Dict[str, Dict[str, Any]] = {
     "雨棚區": {
@@ -457,8 +478,8 @@ def format_phone_number(raw_val) -> str:
 class GoogleDriveSync:
     """Google Drive API 存取與備份同步器，具備完整的自動降級防呆機制"""
 
-    def __init__(self, folder_id: str = DEFAULT_GDRIVE_FOLDER_ID):
-        self.folder_id = folder_id
+    def __init__(self, folder_id: Optional[str] = None):
+        self.folder_id = folder_id or get_gdrive_folder_id()
         self.service = None
         self.is_connected = False
         self.status_message = "尚未初始化"
@@ -498,58 +519,62 @@ class GoogleDriveSync:
             self.is_connected = False
             self.status_message = f"雲端連線嘗試失敗 (已平滑降級為本地儲存): {str(e)}"
 
-    def upload_file_to_drive(self, file_content_bytes: bytes, file_name: str, mime_type: str) -> Tuple[bool, str]:
+    def upload_to_google_drive(self, file_content_bytes: bytes, filename: str, mime_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") -> Tuple[bool, str]:
         """
-        上傳檔案至目標 Google Drive 資料夾 (DVCG)，防範 Service Account 儲存配額錯誤 (HttpError 403)：
-        1. 明確在 file_metadata 中指定 parents=[self.folder_id]
-        2. 在 create 與 update 呼叫中均加入 supportsAllDrives=True
-        3. 若該備份檔名已存在於 DVCG 資料夾中，改呼叫 update 進行覆蓋更新
+        上傳檔案至目標 Google Drive 資料夾 (DVCG)，徹底解決 HttpError 403 (storageQuotaExceeded) 錯誤：
+        1. 在 metadata 中明確傳入 parents 參數指向 DVCG 資料夾
+        2. 採「既有檔案覆蓋 (Update) / 新建 (Create)」雙軌防呆機制
         """
         if not self.is_connected or not self.service:
             return False, f"Google Drive 未連線：{self.status_message}"
+
+        FOLDER_ID = self.folder_id or get_gdrive_folder_id()
+        drive_service = self.service
 
         try:
             from googleapiclient.http import MediaIoBaseUpload
 
             media = MediaIoBaseUpload(io.BytesIO(file_content_bytes), mimetype=mime_type, resumable=True)
 
-            # 1. 查詢目標 DVCG 資料夾中是否已存在同名檔案
-            escaped_name = file_name.replace("'", "\\'")
-            query = f"'{self.folder_id}' in parents and name = '{escaped_name}' and trashed = false"
-            response = self.service.files().list(
+            # 1. 上傳前先查詢 DVCG 資料夾內是否已存在同名檔案
+            escaped_name = filename.replace("'", "\\'")
+            query = f"'{FOLDER_ID}' in parents and name = '{escaped_name}' and trashed = false"
+            response = drive_service.files().list(
                 q=query,
-                spaces="drive",
-                fields="files(id, name, webViewLink)",
                 supportsAllDrives=True,
                 includeItemsFromAllDrives=True,
+                fields="files(id, name, webViewLink)",
             ).execute()
-            existing_files = response.get("files", [])
+            files = response.get("files", [])
 
-            if existing_files:
-                # 2. 檔案已存在：改呼叫 update 進行更新，避免重複建立導致容量配額與權限問題
-                target_file_id = existing_files[0]["id"]
-                file = self.service.files().update(
-                    fileId=target_file_id,
+            file_metadata = {
+                "name": filename,
+                "parents": [FOLDER_ID],
+            }
+
+            if files:
+                # 2. 若檔案已存在：呼叫 update 覆蓋既有檔案 (避免 Service Account 儲存配額問題)
+                file = drive_service.files().update(
+                    fileId=files[0]["id"],
                     media_body=media,
                     supportsAllDrives=True,
-                    fields="id, name, webViewLink",
                 ).execute()
-                return True, f"檔案已成功更新至雲端！檔案 ID: {file.get('id')}，檔名: {file_name}"
+                return True, f"檔案已成功覆蓋更新至雲端！檔案 ID: {file.get('id')}，檔名: {filename}"
             else:
-                # 3. 檔案不存在：執行 create 新建，明確指定 parents 與 supportsAllDrives=True
-                file_metadata = {
-                    "name": file_name,
-                    "parents": [self.folder_id],
-                }
-                file = self.service.files().create(
+                # 3. 若檔案不存在：呼叫 create 新建檔案
+                file = drive_service.files().create(
                     body=file_metadata,
                     media_body=media,
                     supportsAllDrives=True,
                     fields="id, name, webViewLink",
                 ).execute()
-                return True, f"檔案成功備份至雲端！檔案 ID: {file.get('id')}，檔名: {file_name}"
+                return True, f"檔案成功備份至雲端！檔案 ID: {file.get('id')}，檔名: {filename}"
         except Exception as e:
             return False, f"上傳至 Google Drive 失敗: {str(e)}"
+
+    # 方法別名以相容既有呼叫
+    upload_file_to_drive = upload_to_google_drive
+    sync_to_drive = upload_to_google_drive
 
     def backup_database_now(self, operator: str = "系統") -> Tuple[bool, str]:
         """
@@ -579,7 +604,7 @@ class GoogleDriveSync:
             # 嘗試 Google Drive 雲端同步 (優先以「祿野營地資料庫最新備份.xlsx」常駐更新)
             if self.is_connected:
                 latest_cloud_filename = "祿野營地資料庫最新備份.xlsx"
-                success, msg = self.upload_file_to_drive(
+                success, msg = self.upload_to_google_drive(
                     excel_bytes,
                     latest_cloud_filename,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -599,8 +624,16 @@ class GoogleDriveSync:
 
 # 建立全域或快取 GDriveSync 實例
 @st.cache_resource
-def get_gdrive_sync():
-    return GoogleDriveSync()
+def get_gdrive_sync(folder_id: Optional[str] = None):
+    return GoogleDriveSync(folder_id=folder_id)
+
+
+def upload_to_google_drive(file_content_bytes: bytes, filename: str, mime_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", folder_id: Optional[str] = None) -> Tuple[bool, str]:
+    """模組級函式：上傳或覆蓋備份檔案至 Google Drive DVCG 資料夾"""
+    sync_tool = get_gdrive_sync(folder_id=folder_id)
+    return sync_tool.upload_to_google_drive(file_content_bytes, filename, mime_type)
+
+sync_to_drive = upload_to_google_drive
 
 
 def trigger_auto_sync(operator: str):
@@ -1921,7 +1954,7 @@ def render_cloud_sync_view():
         <div class="luye-card">
             <h4>📁 Google Drive 對接資訊</h4>
             <ul>
-                <li><b>目標資料夾 ID</b>：<code>{DEFAULT_GDRIVE_FOLDER_ID}</code> (資料夾名稱：DVCG)</li>
+                <li><b>目標資料夾 ID</b>：<code>{sync_tool.folder_id}</code> (資料夾名稱：DVCG)</li>
                 <li><b>雲端連線狀態</b>：{'<span style="color:#2E7D32; font-weight:700;">🟢 已連線正常</span>' if sync_tool.is_connected else '<span style="color:#E65100; font-weight:700;">🟡 本地儲存模式 (離線平滑降級)</span>'}</li>
                 <li><b>詳細連線說明</b>：{sync_tool.status_message}</li>
             </ul>
