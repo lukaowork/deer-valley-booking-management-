@@ -1393,9 +1393,13 @@ def render_booking_form_view(is_quick_mode: bool = False):
         default_check_in = datetime.strptime(booking_data["check_in_date"], "%Y-%m-%d").date()
         default_check_out = datetime.strptime(booking_data["check_out_date"], "%Y-%m-%d").date()
     else:
-        if "quick_booking_date" in st.session_state and st.session_state["quick_booking_date"]:
-            default_check_in = st.session_state["quick_booking_date"]
+        # 快速預約：自動帶入點選日期 (優先 quick_booking_date，相容 selected_date)
+        quick_date = st.session_state.get("quick_booking_date") or st.session_state.get("selected_date")
+        if quick_date:
+            default_check_in = quick_date
             st.session_state["quick_booking_date"] = None
+            if "selected_date" in st.session_state:
+                st.session_state["selected_date"] = None
         else:
             default_check_in = date.today() + timedelta(days=1)
         default_check_out = default_check_in + timedelta(days=1)
@@ -1433,16 +1437,45 @@ def render_booking_form_view(is_quick_mode: bool = False):
         st.markdown("#### 2. 營位預訂細節與日期 (支援跨區複選)")
 
         col_b1, col_b2, col_b3 = st.columns(3)
-        parsed_defaults = parse_area_quantities(default_area, default_quantity)
+
+        # 跨區數量與各區獨立夜衝數量初始化 (快速預約模式一律歸零)
+        if is_quick_mode:
+            canopy_qty = 0
+            grass_qty = 0
+            room_qty = 0
+            canopy_night_qty = 0
+            grass_night_qty = 0
+            room_night_qty = 0
+        else:
+            parsed_defaults = parse_area_quantities(default_area, 0)
+            canopy_qty = parsed_defaults.get("雨棚區", 0)
+            grass_qty = parsed_defaults.get("草地區", 0)
+            room_qty = parsed_defaults.get("通舖房間", 0)
+            if booking_data and booking_data.get("night_rush_detail"):
+                parsed_rush = parse_area_quantities(booking_data["night_rush_detail"], 0)
+                canopy_night_qty = parsed_rush.get("雨棚區", 0)
+                grass_night_qty = parsed_rush.get("草地區", 0)
+                room_night_qty = parsed_rush.get("通舖房間", 0)
+            else:
+                canopy_night_qty = 0
+                grass_night_qty = 0
+                room_night_qty = 0
         
         with col_b1:
-            qty_shelter = st.number_input("雨棚區 (帳數)", min_value=0, max_value=8, value=min(8, parsed_defaults.get("雨棚區", 0)))
+            qty_shelter = st.number_input("雨棚區 (帳數)", min_value=0, max_value=8, value=min(8, canopy_qty))
+            rush_shelter = st.number_input("⚡ 雨棚區夜衝 (帳數)", min_value=0, max_value=8, value=min(qty_shelter, canopy_night_qty))
+            if rush_shelter > qty_shelter:
+                st.warning("雨棚區夜衝數量不可大於預約數量！")
         with col_b2:
-            qty_grass = st.number_input("草地區 (帳數)", min_value=0, max_value=4, value=min(4, parsed_defaults.get("草地區", 0)))
+            qty_grass = st.number_input("草地區 (帳數)", min_value=0, max_value=4, value=min(4, grass_qty))
+            rush_grass = st.number_input("⚡ 草地區夜衝 (帳數)", min_value=0, max_value=4, value=min(qty_grass, grass_night_qty))
+            if rush_grass > qty_grass:
+                st.warning("草地區夜衝數量不可大於預約數量！")
         with col_b3:
-            qty_room = st.number_input("通舖房間 (間數)", min_value=0, max_value=2, value=min(2, parsed_defaults.get("通舖房間", 0)))
-
-        has_night_rush = st.checkbox("⚡ 包含前晚夜衝 (全預約營位皆享 50% 夜衝折扣)", value=default_night_rush)
+            qty_room = st.number_input("通舖房間 (間數)", min_value=0, max_value=2, value=min(2, room_qty))
+            rush_room = st.number_input("⚡ 通舖夜衝 (間數)", min_value=0, max_value=2, value=min(qty_room, room_night_qty))
+            if rush_room > qty_room:
+                st.warning("通舖房間夜衝數量不可大於預約數量！")
 
         col_d1, col_d2 = st.columns(2)
         with col_d1:
@@ -1456,16 +1489,27 @@ def render_booking_form_view(is_quick_mode: bool = False):
         if qty_grass > 0: area_parts.append(f"草地區 ({qty_grass} 帳)")
         if qty_room > 0: area_parts.append(f"通舖房間 ({qty_room} 間)")
         area_val = "、".join(area_parts) if area_parts else "未選擇"
+
+        # 各區獨立夜衝數量 (不超過該區域預約數量) 與夜衝明細字串
+        eff_rush_shelter = min(qty_shelter, rush_shelter)
+        eff_rush_grass = min(qty_grass, rush_grass)
+        eff_rush_room = min(qty_room, rush_room)
+        total_rush_qty = eff_rush_shelter + eff_rush_grass + eff_rush_room
+        rush_parts = []
+        if eff_rush_shelter > 0: rush_parts.append(f"雨棚區 ({eff_rush_shelter} 帳)")
+        if eff_rush_grass > 0: rush_parts.append(f"草地區 ({eff_rush_grass} 帳)")
+        if eff_rush_room > 0: rush_parts.append(f"通舖房間 ({eff_rush_room} 間)")
+        rush_val = "、".join(rush_parts) if rush_parts else ""
+        has_night_rush = total_rush_qty > 0
         
         if qty_shelter >= 6:
             st.info("🏷️ **雨棚區包區提示**：雨棚預約達 6 帳以上，系統自動認定為【雨棚區包區】，營位總覽看板將連動保留雨棚區 1~8 號全區！")
 
         notes_val = st.text_area("空白文字備註 (特殊需求、車牌、同團成員等)", value=default_notes, placeholder="請在此自由填寫備註...")
 
-        # 即時費用計算
-        night_rush_qty_val = total_qty if has_night_rush else 0
+        # 即時費用計算 (傳入各區獨立夜衝明細)
         calc_total, nights_count, base_fee, rush_fee = calculate_booking_fee(
-            area_val, total_qty, check_in_val, check_out_val, night_rush_qty_val
+            area_val, total_qty, check_in_val, check_out_val, rush_val
         )
 
         st.markdown("---")
@@ -1507,7 +1551,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                             """
                             UPDATE bookings
                             SET check_in_date = ?, check_out_date = ?, name = ?, phone = ?,
-                                area = ?, quantity = ?, night_rush = ?, night_rush_quantity = ?,
+                                area = ?, quantity = ?, night_rush = ?, night_rush_quantity = ?, night_rush_detail = ?,
                                 visit_count = ?, tag = ?, notes = ?, total_amount = ?, updated_at = ?
                             WHERE id = ?
                             """,
@@ -1519,7 +1563,8 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 area_val,
                                 total_qty,
                                 has_night_rush,
-                                int(night_rush_qty_val),
+                                int(total_rush_qty),
+                                rush_val,
                                 visit_count_val,
                                 tag_val,
                                 notes_val.strip(),
@@ -1533,7 +1578,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         add_audit_log(
                             current_user,
                             "修改訂單",
-                            f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {night_rush_qty_val}, 總額: {calc_total})",
+                            f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 總額: {calc_total})",
                         )
                         st.session_state["editing_booking_id"] = None
                         st.session_state["editing_booking_data"] = None
@@ -1562,7 +1607,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 area_val,
                                 total_qty,
                                 has_night_rush,
-                                int(night_rush_qty_val),
+                                int(total_rush_qty),
                                 rush_val,
                                 visit_count_val,
                                 tag_val,
@@ -1578,7 +1623,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         add_audit_log(
                             current_user,
                             "新增訂單",
-                            f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {night_rush_qty_val}, 入住: {check_in_val}, 金額: {calc_total})",
+                            f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 入住: {check_in_val}, 金額: {calc_total})",
                         )
                         st.success(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}")
                         
