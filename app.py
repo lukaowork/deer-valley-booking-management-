@@ -11,11 +11,13 @@ import io
 import json
 import os
 import sqlite3
+import time
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 # ==============================================================================
 # 1. 系統常數與營區規格設定
@@ -267,10 +269,16 @@ POPULAR_HOLIDAYS: List[Tuple[str, date]] = [
 ]
 
 
+def is_shelter_group_booking(area: str, quantity: int) -> bool:
+    """判斷是否為雨棚區包區 (雨棚區且預約數量 >= 6)"""
+    return area == "雨棚區" and int(quantity) >= 6
+
+
 @st.cache_data(ttl=600)
-def get_dashboard_campsite_slots(target_date_str: str) -> Dict[str, List[Dict[str, Any]]]:
+def get_dashboard_campsite_slots(target_date_str: str) -> Dict[str, Any]:
     """
     查詢 target_date_str 當天涵蓋的所有訂單，並映射為各區域各編號營位的詳細狀態
+    支援「雨棚區包區機制」：若雨棚區訂單帳數 >= 6，自動連動標示為雨棚包區
     """
     conn = get_db_connection()
     # 查詢入住日期 <= 選擇日期 < 退房日期的所有訂單
@@ -283,20 +291,33 @@ def get_dashboard_campsite_slots(target_date_str: str) -> Dict[str, List[Dict[st
     conn.close()
 
     slots_by_area: Dict[str, List[Dict[str, Any]]] = {}
+    shelter_group_info: Optional[Dict[str, Any]] = None
+
     for area_name, area_info in CAMP_AREAS.items():
         capacity = area_info["capacity"]
         unit = area_info["unit"]
         area_df = df[df["area"] == area_name]
         area_bookings = area_df.to_dict("records")
 
+        # 檢測是否有雨棚包區訂單
+        has_shelter_group = False
+        group_booking_ref = None
+        if area_name == "雨棚區":
+            for b in area_bookings:
+                if is_shelter_group_booking(b.get("area", ""), b.get("quantity", 0)):
+                    has_shelter_group = True
+                    group_booking_ref = b
+                    shelter_group_info = b
+                    break
+
         slots: List[Dict[str, Any]] = []
         slot_idx = 1
         for b in area_bookings:
             qty = int(b.get("quantity", 1))
             rush_qty = int(b.get("night_rush_quantity", 1 if b.get("night_rush") else 0))
+            is_group = is_shelter_group_booking(b.get("area", ""), qty)
             for i in range(qty):
                 if slot_idx <= capacity:
-                    # 判斷這一個具體營位是否有夜衝
                     has_night_rush = (i < rush_qty) or (b.get("night_rush") == 1 and rush_qty > 0)
                     slots.append({
                         "slot_no": slot_idx,
@@ -304,23 +325,39 @@ def get_dashboard_campsite_slots(target_date_str: str) -> Dict[str, List[Dict[st
                         "booking": b,
                         "has_night_rush": has_night_rush,
                         "rush_qty": rush_qty,
+                        "is_group_booking": is_group,
                     })
                     slot_idx += 1
 
-        # 剩餘未被預訂的營位為空位
+        # 剩餘未被個別分配的營位
         while slot_idx <= capacity:
-            slots.append({
-                "slot_no": slot_idx,
-                "status": "available",
-                "booking": None,
-                "has_night_rush": False,
-                "rush_qty": 0,
-            })
+            # 若為雨棚包區狀態，剩餘未滿帳之帳位亦連動標示為包區空額
+            if area_name == "雨棚區" and has_shelter_group and group_booking_ref:
+                slots.append({
+                    "slot_no": slot_idx,
+                    "status": "group_reserved",
+                    "booking": group_booking_ref,
+                    "has_night_rush": False,
+                    "rush_qty": 0,
+                    "is_group_booking": True,
+                })
+            else:
+                slots.append({
+                    "slot_no": slot_idx,
+                    "status": "available",
+                    "booking": None,
+                    "has_night_rush": False,
+                    "rush_qty": 0,
+                    "is_group_booking": False,
+                })
             slot_idx += 1
 
         slots_by_area[area_name] = slots
 
-    return slots_by_area
+    return {
+        "slots_by_area": slots_by_area,
+        "shelter_group_info": shelter_group_info,
+    }
 
 
 def generate_booking_code(check_in: date) -> str:
@@ -663,10 +700,56 @@ def check_authentication() -> bool:
     return st.session_state["authenticated_user"] is not None
 
 
+def inject_auto_logout_js(timeout_seconds: int = 60):
+    """在 Streamlit 應用程式中嵌入輕量 JavaScript 監聽使用者動作，60 秒無動作自動登出"""
+    js_code = f"""
+    <script>
+    (function() {{
+        const TIMEOUT_MS = {timeout_seconds} * 1000;
+        let timer = null;
+
+        function triggerLogout() {{
+            try {{
+                const targetWin = window.parent || window;
+                const currentUrl = new URL(targetWin.location.href);
+                currentUrl.searchParams.set("auto_logout", "1");
+                targetWin.location.href = currentUrl.toString();
+            }} catch (e) {{
+                window.location.search = "?auto_logout=1";
+            }}
+        }}
+
+        function resetTimer() {{
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(triggerLogout, TIMEOUT_MS);
+        }}
+
+        const events = ['mousemove', 'keydown', 'click', 'scroll', 'touchstart'];
+        try {{
+            const targetDoc = window.parent.document || document;
+            events.forEach(function(evt) {{
+                targetDoc.addEventListener(evt, resetTimer, true);
+            }});
+        }} catch (e) {{
+            events.forEach(function(evt) {{
+                document.addEventListener(evt, resetTimer, true);
+            }});
+        }}
+        resetTimer();
+    }})();
+    </script>
+    """
+    components.html(js_code, height=0, width=0)
+
+
 def render_login_view():
     """渲染極簡安全 PIN 碼登入畫面"""
     col1, col2, col3 = st.columns([1, 1.6, 1])
     with col2:
+        if st.session_state.get("timeout_logged_out"):
+            st.warning("因超過 60 秒無操作，系統已自動登出以維護資安。")
+            st.session_state["timeout_logged_out"] = False
+
         st.markdown(
             """
             <div style="text-align: center; padding: 32px 24px; background: white; border-radius: 16px; box-shadow: 0 8px 24px rgba(0,0,0,0.06); border-top: 6px solid #2E7D32;">
@@ -702,39 +785,49 @@ def render_login_view():
 def render_dashboard_view():
     st.markdown("### 📊 營區營位總覽看板 (週末連動與分區營位圖)")
 
-    # 1. 初始化週末連動預設日期 (預設為本週六或下個週末)
-    if "dashboard_target_date" not in st.session_state:
-        st.session_state["dashboard_target_date"] = get_upcoming_saturday()
+    # 1. 統一管理週末連動狀態，預設為本週六
+    if "dashboard_selected_date" not in st.session_state:
+        st.session_state["dashboard_selected_date"] = get_upcoming_saturday()
 
-    # 快捷跳轉按鈕工具列
+    # 快捷跳轉按鈕工具列 (修復點擊切換日期重置 Bug，全面同步 session_state)
     b_col1, b_col2, b_col3, d_col = st.columns([1, 1, 1.2, 2.2])
     with b_col1:
         if st.button("📅 [本週末]", use_container_width=True):
-            st.session_state["dashboard_target_date"] = get_upcoming_saturday()
+            target_dt = get_upcoming_saturday()
+            st.session_state["dashboard_selected_date"] = target_dt
+            st.session_state["dash_date_picker"] = target_dt
             st.rerun()
     with b_col2:
         if st.button("⏩ [下週末]", use_container_width=True):
-            st.session_state["dashboard_target_date"] = get_next_weekend()
+            target_dt = get_next_weekend()
+            st.session_state["dashboard_selected_date"] = target_dt
+            st.session_state["dash_date_picker"] = target_dt
             st.rerun()
     with b_col3:
         with st.popover("🎌 [連假預約]"):
             st.write("快捷選擇常見熱門連假日期：")
             for h_title, h_dt in POPULAR_HOLIDAYS:
                 if st.button(f"{h_title} ({h_dt.strftime('%m/%d')})", key=f"holiday_btn_{h_dt}", use_container_width=True):
-                    st.session_state["dashboard_target_date"] = h_dt
+                    st.session_state["dashboard_selected_date"] = h_dt
+                    st.session_state["dash_date_picker"] = h_dt
                     st.rerun()
 
     with d_col:
-        selected_date = st.date_input(
-            "📅 自訂檢視日期：",
-            value=st.session_state["dashboard_target_date"],
-            min_value=date.today() - timedelta(days=365),
-            key="dash_date_picker",
-        )
-        if selected_date != st.session_state["dashboard_target_date"]:
-            st.session_state["dashboard_target_date"] = selected_date
-            st.rerun()
+        # 使用固定 key 搭配 on_change callback，確保與快捷按鈕雙向無縫同步不重置
+        def on_dashboard_date_change():
+            st.session_state["dashboard_selected_date"] = st.session_state["dash_date_picker"]
 
+        if "dash_date_picker" not in st.session_state or st.session_state["dash_date_picker"] != st.session_state["dashboard_selected_date"]:
+            st.session_state["dash_date_picker"] = st.session_state["dashboard_selected_date"]
+
+        st.date_input(
+            "📅 自訂檢視日期：",
+            key="dash_date_picker",
+            min_value=date.today() - timedelta(days=365),
+            on_change=on_dashboard_date_change,
+        )
+
+    selected_date = st.session_state["dashboard_selected_date"]
     weekday_names = ["週一", "週二", "週三", "週四", "週五", "週六", "週日"]
     weekday_str = weekday_names[selected_date.weekday()]
     is_weekend_flag = selected_date.weekday() in [4, 5, 6]
@@ -752,7 +845,9 @@ def render_dashboard_view():
 
     # 取得快取的營位槽位資訊與統計 (600秒快取)
     date_str = selected_date.strftime("%Y-%m-%d")
-    slots_by_area = get_dashboard_campsite_slots(date_str)
+    slots_data = get_dashboard_campsite_slots(date_str)
+    slots_by_area = slots_data["slots_by_area"]
+    shelter_group_info = slots_data.get("shelter_group_info")
     occupied_map, df_in, df_out = get_dashboard_summary(date_str)
 
     # 頂部三大區域整體容量卡片
@@ -765,13 +860,22 @@ def render_dashboard_view():
         occupancy_rate = min(100, int((booked / capacity) * 100)) if capacity > 0 else 0
 
         with sum_cols[i]:
+            group_tag_badge = ""
+            if area_name == "雨棚區" and shelter_group_info:
+                group_tag_badge = ' <span style="background:#FFF8E1; color:#F57F17; border:1px solid #FFE082; padding:1px 6px; border-radius:8px; font-size:0.75rem; font-weight:700;">🏷️ 雨棚包區</span>'
+                status_text = '🈵 全區包場'
+                status_color = '#E65100'
+            else:
+                status_text = '🈵 已滿帳' if remaining == 0 else f'剩餘 {remaining} {unit}'
+                status_color = '#C62828' if remaining == 0 else '#2E7D32'
+
             st.markdown(
                 f"""
                 <div class="luye-card" style="border-left: 5px solid {info['color']}; margin-bottom: 12px; padding: 12px 16px;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <h4 style="margin:0; color:{info['color']};">{area_name}</h4>
-                        <span style="font-size:0.85rem; font-weight:600; color:{'#C62828' if remaining==0 else '#2E7D32'};">
-                            {'🈵 已滿帳' if remaining==0 else f'剩餘 {remaining} {unit}'}
+                        <h4 style="margin:0; color:{info['color']};">{area_name}{group_tag_badge}</h4>
+                        <span style="font-size:0.85rem; font-weight:600; color:{status_color};">
+                            {status_text}
                         </span>
                     </div>
                     <div style="font-size:0.85rem; color:#666; margin-top:4px;">
@@ -791,6 +895,24 @@ def render_dashboard_view():
     for area_name, slots in slots_by_area.items():
         area_info = CAMP_AREAS[area_name]
         unit = area_info["unit"]
+
+        # 雨棚包區醒目橫幅提示
+        if area_name == "雨棚區" and shelter_group_info:
+            st.markdown(
+                f"""
+                <div style="background:#FFFDE7; border: 1.5px solid #FBC02D; border-radius: 8px; padding: 10px 16px; margin-bottom: 12px; display:flex; justify-content:space-between; align-items:center;">
+                    <div>
+                        <span style="font-size: 1.05rem; font-weight: 700; color: #E65100;">🏷️ 雨棚包區生效中</span>
+                        <span style="font-size: 0.9rem; color: #4E342E; margin-left: 10px;">
+                            包區人：<b>{shelter_group_info.get('name')}</b> ({shelter_group_info.get('phone')}) ｜ 預約 <b>{shelter_group_info.get('quantity')}</b> 帳 (滿 6 帳自動包區)
+                        </span>
+                    </div>
+                    <span style="background:#F57F17; color:white; font-size:0.8rem; font-weight:700; padding:2px 8px; border-radius:12px;">雨棚全區專屬</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
         st.markdown(f"#### 🏕️ {area_name} ({len(slots)} {unit} 營位狀況)")
 
         num_cols = 4 if len(slots) >= 4 else len(slots)
@@ -802,6 +924,7 @@ def render_dashboard_view():
             status = slot["status"]
             b_info = slot["booking"]
             has_rush = slot["has_night_rush"]
+            is_group = slot.get("is_group_booking", False)
 
             with col_target:
                 if status == "available":
@@ -816,6 +939,24 @@ def render_dashboard_view():
                         """,
                         unsafe_allow_html=True,
                     )
+                elif status == "group_reserved" and b_info:
+                    # 雨棚包區連動保留卡片
+                    st.markdown(
+                        f"""
+                        <div style="background:#FFFDE7; border: 1.5px solid #FBC02D; border-radius: 10px; padding: 12px 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.04); margin-bottom: 6px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center;">
+                                <span style="font-weight: 700; color: #F57F17; font-size: 1.05rem;">⛺ {area_name} {slot_no} 號</span>
+                                <span style="background: #FFF8E1; color: #E65100; border:1px solid #FFE082; font-size: 0.75rem; padding: 1px 6px; border-radius: 6px; font-weight: 700;">🏷️ 雨棚包區</span>
+                            </div>
+                            <div style="margin-top: 8px; font-size: 0.9rem; font-weight: 700; color: #5D4037;">👤 {b_info.get('name')} (包區保留)</div>
+                            <div style="font-size: 0.82rem; color: #795548; margin-top: 2px;">📞 {b_info.get('phone')}</div>
+                            <div style="margin-top: 6px;">
+                                <span style="background:#FFF3E0; color:#E65100; padding:1px 6px; border-radius:8px; font-size:0.75rem;">整區包場額度</span>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
                 else:
                     # 已預訂卡片
                     name = b_info.get("name", "露營客")
@@ -824,17 +965,22 @@ def render_dashboard_view():
                     tag_style = TAG_BADGE_STYLE.get(tag, TAG_BADGE_STYLE["一般"])
                     rush_qty_num = b_info.get("night_rush_quantity", 1 if b_info.get("night_rush") else 0)
                     rush_badge = (
-                        f'<span style="background:#FFF3E0; color:#E65100; border:1px solid #FFE0B2; padding:1px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">⚡ 夜衝 ({rush_qty_num}{unit})</span>'
+                        f'<span style="background:#FFF3E0; color:#E65100; border:1px solid #FFE082; padding:1px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">⚡ 夜衝 ({rush_qty_num}{unit})</span>'
                         if (has_rush or rush_qty_num > 0)
                         else '<span style="background:#ECEFF1; color:#546E7A; padding:1px 6px; border-radius:10px; font-size:0.75rem;">無夜衝</span>'
+                    )
+                    group_badge = (
+                        '<span style="background:#FFF8E1; color:#E65100; border:1px solid #FFE082; font-size:0.75rem; padding:1px 6px; border-radius:6px; font-weight:700;">🏷️ 雨棚包區</span>'
+                        if is_group
+                        else '<span style="background: #FFEBEE; color: #C62828; font-size: 0.75rem; padding: 2px 6px; border-radius: 6px; font-weight: 700;">🔴 已預訂</span>'
                     )
 
                     st.markdown(
                         f"""
-                        <div style="background:white; border: 1.5px solid #FF9800; border-radius: 10px; padding: 12px 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.04); margin-bottom: 6px;">
+                        <div style="background:white; border: 1.5px solid {'#FBC02D' if is_group else '#FF9800'}; border-radius: 10px; padding: 12px 14px; box-shadow: 0 2px 6px rgba(0,0,0,0.04); margin-bottom: 6px;">
                             <div style="display:flex; justify-content:space-between; align-items:center;">
-                                <span style="font-weight: 700; color: #BF360C; font-size: 1.05rem;">⛺ {area_name} {slot_no} 號</span>
-                                <span style="background: #FFEBEE; color: #C62828; font-size: 0.75rem; padding: 2px 6px; border-radius: 6px; font-weight: 700;">🔴 已預訂</span>
+                                <span style="font-weight: 700; color: {'#E65100' if is_group else '#BF360C'}; font-size: 1.05rem;">⛺ {area_name} {slot_no} 號</span>
+                                {group_badge}
                             </div>
                             <div style="margin-top: 8px; font-size: 0.95rem; font-weight: 700; color: #212121;">👤 {name}</div>
                             <div style="font-size: 0.85rem; color: #555; margin-top: 2px;">📞 {phone}</div>
@@ -848,11 +994,13 @@ def render_dashboard_view():
                     )
 
                     # 點擊卡片彈出查看該訂單詳細資訊與備註
-                    with st.popover(f"📝 訂單備註 (單號 {b_info.get('booking_code', '')[-8:]})", use_container_width=True):
+                    with st.popover(f"📝 訂單備註 ({b_info.get('booking_code', '')[-8:]})", use_container_width=True):
                         st.markdown(f"**訂單編號**：`{b_info.get('booking_code')}`")
                         st.markdown(f"**露營客**：{name} ({phone})")
                         st.markdown(f"**住宿期間**：{b_info.get('check_in_date')} 至 {b_info.get('check_out_date')}")
                         st.markdown(f"**預約總量**：{b_info.get('quantity')} {unit} (其中夜衝: {rush_qty_num} {unit})")
+                        if is_group:
+                            st.markdown("🌟 **包區標記**：`雨棚區全包區 (滿 6 帳)`")
                         st.markdown(f"**應收總額**：NT$ {b_info.get('total_amount', 0):,}")
                         notes_txt = b_info.get("notes", "").strip()
                         if notes_txt:
@@ -978,6 +1126,10 @@ def render_bookings_view():
     with view_tab1:
         if not df_results.empty:
             display_df = df_results.copy()
+            display_df["area"] = display_df.apply(
+                lambda r: f"{r['area']} (🏷️包區)" if is_shelter_group_booking(r.get("area", ""), r.get("quantity", 0)) else r["area"],
+                axis=1,
+            )
             display_df["night_rush"] = display_df.apply(
                 lambda r: f"⚡ {int(r.get('night_rush_quantity', 1))} {CAMP_AREAS.get(r.get('area'), {}).get('unit', '帳')}"
                 if (r.get("night_rush") == 1 or (r.get("night_rush_quantity") is not None and r.get("night_rush_quantity") > 0))
@@ -1029,17 +1181,24 @@ def render_bookings_view():
                 area_unit = CAMP_AREAS.get(row["area"], {}).get("unit", "帳")
                 rush_num = int(row.get("night_rush_quantity", 1 if row.get("night_rush") else 0))
                 has_rush_flag = (row.get("night_rush") == 1 or rush_num > 0)
+                is_group_shelter = is_shelter_group_booking(row.get("area", ""), row.get("quantity", 0))
+                shelter_group_badge = (
+                    ' <span style="background:#FFF8E1; color:#F57F17; border:1px solid #FFE082; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem;">🏷️ 雨棚包區</span>'
+                    if is_group_shelter
+                    else ""
+                )
 
                 card_box = st.container()
                 with card_box:
                     st.markdown(
                         f"""
-                        <div class="luye-card">
+                        <div class="luye-card" style="{'border-left: 5px solid #FBC02D;' if is_group_shelter else ''}">
                             <div style="display:flex; justify-content:space-between; align-items:center;">
                                 <div>
                                     <span style="font-size:1.2rem; font-weight:700; color:#1B5E20;">{row['name']}</span>
                                     <span style="font-size:0.95rem; color:#666; margin-left:12px;">📞 {row['phone']}</span>
                                     <span style="{tag_style}; margin-left:10px;">{row['tag']}</span>
+                                    {shelter_group_badge}
                                     <span style="background:#E0F2F1; color:#00695C; padding:2px 8px; border-radius:12px; font-size:0.8rem; margin-left:6px;">第 {row['visit_count']} 次到訪</span>
                                 </div>
                                 <div>
@@ -1047,7 +1206,7 @@ def render_bookings_view():
                                 </div>
                             </div>
                             <div style="margin-top:10px; font-size:0.92rem; color:#333; display:flex; flex-wrap:wrap; gap:16px;">
-                                <div>🏕️ <b>區域</b>：{row['area']} ({row['quantity']} {area_unit})</div>
+                                <div>🏕️ <b>區域</b>：{row['area']} ({row['quantity']} {area_unit}) {'(滿 6 帳包區)' if is_group_shelter else ''}</div>
                                 <div>📅 <b>入住~退房</b>：{row['check_in_date']} 至 {row['check_out_date']}</div>
                                 <div>⚡ <b>夜衝</b>：{f'是 ({rush_num} {area_unit})' if has_rush_flag else '否'}</div>
                                 <div>🔖 <b>訂單號</b>：<code>{row['booking_code']}</code></div>
@@ -1063,7 +1222,8 @@ def render_bookings_view():
                     with btn_c1:
                         if st.button("✏️ 編輯", key=f"edit_btn_{row['id']}"):
                             st.session_state["editing_booking_id"] = row["id"]
-                            st.session_state["main_navigation"] = "➕ 新增露營預約"
+                            st.session_state["editing_booking_data"] = dict(row)
+                            st.session_state["jump_to_page"] = "➕ 新增露營預約"
                             st.rerun()
                     with btn_c2:
                         with st.popover("🗑️ 刪除"):
@@ -1098,24 +1258,29 @@ def render_booking_form_view():
 
     booking_data = None
     if is_editing:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM bookings WHERE id = ?", (editing_id,))
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            booking_data = dict(row)
+        if "editing_booking_data" in st.session_state and st.session_state["editing_booking_data"]:
+            booking_data = st.session_state["editing_booking_data"]
         else:
-            st.warning("找不到該筆編輯訂單，已切換回新增模式。")
-            st.session_state["editing_booking_id"] = None
-            is_editing = False
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM bookings WHERE id = ?", (editing_id,))
+            row = cursor.fetchone()
+            conn.close()
+            if row:
+                booking_data = dict(row)
+            else:
+                st.warning("找不到該筆編輯訂單，已切換回新增模式。")
+                st.session_state["editing_booking_id"] = None
+                st.session_state["editing_booking_data"] = None
+                is_editing = False
 
     st.markdown(f"### {'✏️ 編輯露營訂位資料' if is_editing else '➕ 新增露營客預約訂單'}")
 
-    if is_editing:
+    if is_editing and booking_data:
         st.info(f"正在編輯訂單：**{booking_data['booking_code']}** (露營客: {booking_data['name']})")
         if st.button("⬅️ 取消編輯，切換回新增預約模式"):
             st.session_state["editing_booking_id"] = None
+            st.session_state["editing_booking_data"] = None
             st.rerun()
 
     # 預設值設定
@@ -1199,6 +1364,9 @@ def render_booking_form_view():
         with col_d2:
             check_out_val = st.date_input("預計退房日期 *", value=default_check_out)
 
+        if area_val == "雨棚區" and quantity_val >= 6:
+            st.info("🏷️ **雨棚區包區提示**：預約數量達 6 帳以上，系統自動認定為【雨棚區包區】，營位總覽看板將連動保留雨棚區 1~8 號全區！")
+
         notes_val = st.text_area("空白文字備註 (特殊需求、車牌、同團成員等)", value=default_notes, placeholder="請在此自由填寫備註...")
 
         # 即時費用計算 (夜衝帳數獨立計費)
@@ -1272,6 +1440,7 @@ def render_booking_form_view():
                             f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val} {quantity_val}{unit_str}, 夜衝: {night_rush_qty_val}{unit_str}, 總額: {calc_total})",
                         )
                         st.session_state["editing_booking_id"] = None
+                        st.session_state["editing_booking_data"] = None
                         st.success(f"訂單 {booking_data['booking_code']} 修改成功！")
                     else:
                         # 新增訂單
@@ -1676,20 +1845,29 @@ def render_admin_management_view():
     with col_list:
         st.markdown("#### 目前授權管理人清單")
         for pin, name in list(admins.items()):
-            is_current = name == current_user
+            is_current = (name == current_user)
             with st.container():
-                st.markdown(
-                    f"""
-                    <div style="background:white; border:1px solid #E0E0E0; border-radius:8px; padding:12px 16px; margin-bottom:10px; display:flex; justify-content:space-between; align-items:center;">
-                        <div>
-                            <span style="font-weight:700; font-size:1.1rem; color:#2E7D32;">{name}</span>
-                            {' <span style="font-size:0.75rem; background:#C8E6C9; color:#1B5E20; padding:2px 6px; border-radius:8px;">目前在線</span>' if is_current else ''}
-                            <div style="color:#757575; font-size:0.85rem; margin-top:2px;">PIN 碼：<code>****{pin[-2:]}</code></div>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+                online_badge = (
+                    '<span style="font-size:0.75rem; background:#C8E6C9; color:#1B5E20; padding:2px 8px; border-radius:10px; margin-left:8px; font-weight:600;">目前在線</span>'
+                    if is_current else ""
                 )
+                admin_card_html = (
+                    f'<div style="background:#FFFFFF; border:1px solid #E0E0E0; border-radius:10px; padding:14px 16px; margin-bottom:8px; box-shadow:0 1px 3px rgba(0,0,0,0.03);">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                    f'<div>'
+                    f'<div style="display:flex; align-items:center;">'
+                    f'<span style="font-weight:700; font-size:1.1rem; color:#2E7D32;">{name}</span>'
+                    f'{online_badge}'
+                    f'</div>'
+                    f'<div style="color:#757575; font-size:0.85rem; margin-top:4px;">PIN 碼：<code style="background:#F5F5F5; padding:2px 6px; border-radius:4px; font-weight:600;">****{pin[-2:]}</code></div>'
+                    f'</div>'
+                    f'</div>'
+                    f'</div>'
+                )
+                if hasattr(st, "html"):
+                    st.html(admin_card_html)
+                else:
+                    st.markdown(admin_card_html, unsafe_allow_html=True)
 
                 # 刪除防呆
                 with st.popover(f"刪除 {name} 的權限"):
@@ -1827,20 +2005,45 @@ def main():
     init_db()
     init_admins()
 
+    # 檢查是否因 60 秒無動作觸發資安自動登出
+    if st.query_params.get("auto_logout") == "1":
+        st.query_params.clear()
+        user_name = st.session_state.get("authenticated_user", "管理員")
+        if user_name:
+            add_audit_log(user_name, "資安自動登出", "超過 60 秒無操作，系統自動登出以維護資安")
+        st.session_state["authenticated_user"] = None
+        st.session_state["authenticated_pin"] = None
+        st.session_state["editing_booking_id"] = None
+        st.session_state["editing_booking_data"] = None
+        st.session_state["timeout_logged_out"] = True
+        st.rerun()
+
     # 檢查登入狀態
     if not check_authentication():
         render_login_view()
         return
 
-    # 初始化固定 navigation key，防止重複點擊與 state 丟失
+    # 已登入：嵌入 60 秒無動作自動登出監聽機制 (監聽 MouseMove, KeyDown, Click, Scroll, Touch)
+    inject_auto_logout_js(60)
+
+    # 導覽選單清單
     nav_options = [
         "📊 營位總覽看板",
         "➕ 新增露營預約",
         "🔍 訂位管理與搜尋",
         "⚙️ 系統管理",
     ]
+
+    # 若有外部跳轉請求 (例如點擊卡片上的【編輯】按鈕)，在選單 widget 實例化前優先套用，杜絕 StreamlitWidgetAlreadyInstantiatedError
+    if "jump_to_page" in st.session_state and st.session_state["jump_to_page"] in nav_options:
+        target_page = st.session_state.pop("jump_to_page")
+        st.session_state["main_navigation"] = target_page
+
     if "main_navigation" not in st.session_state or st.session_state["main_navigation"] not in nav_options:
         st.session_state["main_navigation"] = nav_options[0]
+
+    current_nav = st.session_state["main_navigation"]
+    nav_index = nav_options.index(current_nav)
 
     # 頂部橫幅 Header
     st.markdown(
@@ -1870,6 +2073,7 @@ def main():
         page_selection = st.radio(
             "前往模組：",
             nav_options,
+            index=nav_index,
             key="main_navigation",
         )
 
@@ -1896,6 +2100,7 @@ def main():
             st.session_state["authenticated_user"] = None
             st.session_state["authenticated_pin"] = None
             st.session_state["editing_booking_id"] = None
+            st.session_state["editing_booking_data"] = None
             st.rerun()
 
     # 路由渲染對應頁面
