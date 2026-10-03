@@ -1231,7 +1231,7 @@ def render_bookings_view():
 
                 card_box = st.container()
                 with card_box:
-                    st.markdown(
+                    card_html = (
                         f"""
                         <div class="luye-card" style="{'border-left: 5px solid #FBC02D;' if is_group_shelter else ''}">
                             <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -1255,9 +1255,12 @@ def render_bookings_view():
                             </div>
                             {f'<div style="margin-top:8px; padding:6px 10px; background:#FFF9C4; border-radius:6px; font-size:0.88rem; color:#5D4037;">📝 備註：{row["notes"]}</div>' if row["notes"] else ''}
                         </div>
-                        """,
-                        unsafe_allow_html=True,
+                        """
                     )
+                    if hasattr(st, "html"):
+                        st.html(card_html)
+                    else:
+                        st.markdown(card_html, unsafe_allow_html=True)
 
                     btn_c1, btn_c2, btn_c3 = st.columns([1, 1, 6])
                     with btn_c1:
