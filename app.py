@@ -960,8 +960,10 @@ def render_dashboard_view():
         for i, dt in enumerate(week):
             with w_cols[i]:
                 is_selected = (dt == st.session_state["dashboard_selected_date"])
+                is_today = (dt == date.today())
                 btn_type = "primary" if is_selected else "secondary"
                 day_label = f"{dt.month}/{dt.day}" if dt.day == 1 else f"{dt.day}"
+                weekday_label = day_names[dt.weekday()]
                 
                 # 計算當日各區域預約狀況
                 mask = (pd.to_datetime(df_all["check_in_date"]).dt.date <= dt) & (pd.to_datetime(df_all["check_out_date"]).dt.date > dt)
@@ -984,34 +986,50 @@ def render_dashboard_view():
                         if rush_qty > 0:
                             has_night_rush = True
                 
+                # 格子容器開頭：圓角微邊框 + 內襯 + 當日/選取日高亮 (Flex 佈局)
+                if is_selected:
+                    cell_border, cell_bg = "#1565C0", "#E3F2FD"
+                elif is_today:
+                    cell_border, cell_bg = "#2E7D32", "#E8F5E9"
+                else:
+                    cell_border, cell_bg = "#E0E0E0", "#FFFFFF"
+
+                st.markdown(
+                    f'<div style="border:1px solid {cell_border}; border-radius:8px; padding:8px; '
+                    f'background:{cell_bg}; display:flex; flex-direction:column; gap:4px; min-height:120px;">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                    f'<span style="font-size:0.9rem; opacity:0.8; font-weight:700; color:#424242;">{day_label}</span>'
+                    f'<span style="font-size:0.85rem; opacity:0.8; color:#757575;">{weekday_label}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
                 # 日期按鈕
                 if st.button(day_label, key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
                     st.session_state["dashboard_selected_date"] = dt
                     st.rerun()
                 
-                # 極簡色彩點點與標籤 HTML
+                # 放大狀態點點 (深色圓點直徑 13px，文字 0.9rem / font-weight 600)
                 badges = []
                 if summary["雨棚區"] > 0:
-                    badges.append(f'<div style="font-size:0.75rem; color:#2E7D32; font-weight:600; text-align:center;">🟢 雨棚 x{summary["雨棚區"]}</div>')
+                    badges.append(f'<div style="font-size:0.9rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#2E7D32; margin-right:6px;"></span>雨棚 x{summary["雨棚區"]}</div>')
                 if summary["草地區"] > 0:
-                    badges.append(f'<div style="font-size:0.75rem; color:#E65100; font-weight:600; text-align:center;">🟠 草地 x{summary["草地區"]}</div>')
+                    badges.append(f'<div style="font-size:0.9rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#EF6C00; margin-right:6px;"></span>草地 x{summary["草地區"]}</div>')
                 if summary["通舖房間"] > 0:
-                    badges.append(f'<div style="font-size:0.75rem; color:#6A1B9A; font-weight:600; text-align:center;">🟣 通鋪 x{summary["通舖房間"]}</div>')
+                    badges.append(f'<div style="font-size:0.9rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#8E24AA; margin-right:6px;"></span>通鋪 x{summary["通舖房間"]}</div>')
                 
                 tags = []
                 if has_group:
-                    tags.append('<span style="background:#FFF8E1; color:#F57F17; border:1px solid #FFE082; padding:1px 4px; border-radius:4px; font-size:0.65rem; font-weight:bold; margin-right:4px;">🏷️ 包區</span>')
+                    tags.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 10px; border-radius:999px; font-size:0.72rem; font-weight:700;">🏷️ 包區</span>')
                 if has_night_rush:
-                    tags.append('<span style="background:#FFF3E0; color:#E65100; border:1px solid #FFE082; padding:1px 4px; border-radius:4px; font-size:0.65rem; font-weight:bold;">⚡ 夜衝</span>')
+                    tags.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 10px; border-radius:999px; font-size:0.72rem; font-weight:700;">⚡ 夜衝</span>')
                 
-                tags_html = f'<div style="margin-top:4px; text-align:center; min-height:22px;">{"".join(tags)}</div>'
-                badges_html = "".join(badges) if badges else '<div style="min-height:20px;"></div>'
+                tags_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px; min-height:22px;">{"".join(tags)}</div>'
+                badges_html = f'<div style="display:flex; flex-direction:column; gap:2px; margin-top:2px;">{"".join(badges)}</div>' if badges else '<div style="min-height:20px;"></div>'
                 
-                final_html = f'<div style="margin-top:-10px; margin-bottom:10px;">{badges_html}{tags_html}</div>'
-                if hasattr(st, "html"):
-                    st.html(final_html)
-                else:
-                    st.markdown(final_html, unsafe_allow_html=True)
+                # 關閉格子容器 (所有自訂 HTML 均帶 unsafe_allow_html=True)
+                final_html = f'{badges_html}{tags_html}</div><div style="height:10px;"></div>'
+                st.markdown(final_html, unsafe_allow_html=True)
 
     # 3. 日期點擊與側邊/下方「訂單資料抽屜 (Drawer)」
     selected_dt = st.session_state["dashboard_selected_date"]
@@ -1438,28 +1456,51 @@ def render_booking_form_view(is_quick_mode: bool = False):
 
         col_b1, col_b2, col_b3 = st.columns(3)
 
-        # 跨區數量與各區獨立夜衝數量初始化 (快速預約模式一律歸零)
+        # 跨區數量與各區獨立夜衝數量初始化
         if is_quick_mode:
+            # 快速預約模式一律歸零
             canopy_qty = 0
             grass_qty = 0
             room_qty = 0
             canopy_night_qty = 0
             grass_night_qty = 0
             room_night_qty = 0
-        else:
-            parsed_defaults = parse_area_quantities(default_area, 0)
+        elif is_editing and booking_data:
+            # 編輯模式：精準還原原訂單各區域數量 (禁止直接歸零)
+            # 舊格式無括號字串時，以訂單總數量作為該區域數量
+            fallback_total = int(booking_data.get("quantity", 0) or 0)
+            parsed_defaults = parse_area_quantities(default_area, fallback_total)
             canopy_qty = parsed_defaults.get("雨棚區", 0)
             grass_qty = parsed_defaults.get("草地區", 0)
             room_qty = parsed_defaults.get("通舖房間", 0)
-            if booking_data and booking_data.get("night_rush_detail"):
-                parsed_rush = parse_area_quantities(booking_data["night_rush_detail"], 0)
+            # 各區獨立夜衝數量：優先解析 night_rush_detail 明細
+            rush_detail_str = str(booking_data.get("night_rush_detail") or "")
+            if rush_detail_str:
+                parsed_rush = parse_area_quantities(rush_detail_str, 0)
                 canopy_night_qty = parsed_rush.get("雨棚區", 0)
                 grass_night_qty = parsed_rush.get("草地區", 0)
                 room_night_qty = parsed_rush.get("通舖房間", 0)
             else:
+                # 舊資料相容：無明細時將夜衝總數配給首個有預約的區域
                 canopy_night_qty = 0
                 grass_night_qty = 0
                 room_night_qty = 0
+                old_rush_qty = int(booking_data.get("night_rush_quantity", 0) or 0)
+                if old_rush_qty > 0:
+                    if canopy_qty > 0:
+                        canopy_night_qty = min(canopy_qty, old_rush_qty)
+                    elif grass_qty > 0:
+                        grass_night_qty = min(grass_qty, old_rush_qty)
+                    elif room_qty > 0:
+                        room_night_qty = min(room_qty, old_rush_qty)
+        else:
+            # 一般新增模式：全部歸零
+            canopy_qty = 0
+            grass_qty = 0
+            room_qty = 0
+            canopy_night_qty = 0
+            grass_night_qty = 0
+            room_night_qty = 0
         
         with col_b1:
             qty_shelter = st.number_input("雨棚區 (帳數)", min_value=0, max_value=8, value=min(8, canopy_qty))
