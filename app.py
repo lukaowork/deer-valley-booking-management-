@@ -30,25 +30,33 @@ DB_PATH = os.path.join(DATA_DIR, "luye_camping.db")
 ADMIN_CONFIG_PATH = os.path.join(DATA_DIR, "admins.json")
 SERVICE_ACCOUNT_PATH = os.path.join(DATA_DIR, "service_account.json")
 
-# Google Drive 預設目標資料夾 (DVCG)
-DEFAULT_GDRIVE_FOLDER_ID = "1JFzbSQuolGniXeAeeaX3okbUZPQ-Rzok"
+# Google Drive 目標資料夾 (DVCG 資料夾 ID)
+DVCG_FOLDER_ID = "1JFzbSQuolGniXeAeeaX3okbUZPQ-Rzok"
+DEFAULT_GDRIVE_FOLDER_ID = DVCG_FOLDER_ID
 
 
 def get_gdrive_folder_id() -> str:
-    """取得 Google Drive 目標資料夾 ID (依序檢查 st.secrets, 環境變數, 預設常數)"""
+    """取得 Google Drive 目標資料夾 ID (依序檢查 st.secrets 與環境變數，預設回退至 DVCG_FOLDER_ID)"""
     try:
         if hasattr(st, "secrets"):
+            # 優先嘗試 1: st.secrets["google_drive"]["folder_id"]
+            if "google_drive" in st.secrets and isinstance(st.secrets["google_drive"], dict):
+                if "folder_id" in st.secrets["google_drive"]:
+                    return str(st.secrets["google_drive"]["folder_id"]).strip()
+            # 嘗試 2: st.secrets["gcp_service_account"]["folder_id"]
+            if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict):
+                if "folder_id" in st.secrets["gcp_service_account"]:
+                    return str(st.secrets["gcp_service_account"]["folder_id"]).strip()
+            # 嘗試 3: 其他常見單層 Secrets
             if "gdrive_folder_id" in st.secrets:
                 return str(st.secrets["gdrive_folder_id"]).strip()
             if "GDRIVE_FOLDER_ID" in st.secrets:
                 return str(st.secrets["GDRIVE_FOLDER_ID"]).strip()
             if "FOLDER_ID" in st.secrets:
                 return str(st.secrets["FOLDER_ID"]).strip()
-            if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict) and "folder_id" in st.secrets["gcp_service_account"]:
-                return str(st.secrets["gcp_service_account"]["folder_id"]).strip()
     except Exception:
         pass
-    return os.environ.get("GDRIVE_FOLDER_ID", os.environ.get("FOLDER_ID", DEFAULT_GDRIVE_FOLDER_ID)).strip()
+    return os.environ.get("GDRIVE_FOLDER_ID", os.environ.get("FOLDER_ID", DVCG_FOLDER_ID)).strip()
 
 
 # 全域 FOLDER_ID (供備份模組調用)
@@ -545,23 +553,23 @@ class GoogleDriveSync:
                 includeItemsFromAllDrives=True,
                 fields="files(id, name, webViewLink)",
             ).execute()
-            files = response.get("files", [])
+            items = response.get("files", [])
 
             file_metadata = {
                 "name": filename,
                 "parents": [FOLDER_ID],
             }
 
-            if files:
-                # 2. 若檔案已存在：呼叫 update 覆蓋既有檔案 (避免 Service Account 儲存配額問題)
+            if len(items) > 0:
+                # 2. 若檔案已存在 (len(items) > 0)：使用 update 方法覆蓋舊檔 (避免 Service Account 儲存配額問題)
                 file = drive_service.files().update(
-                    fileId=files[0]["id"],
+                    fileId=items[0]["id"],
                     media_body=media,
                     supportsAllDrives=True,
                 ).execute()
                 return True, f"檔案已成功覆蓋更新至雲端！檔案 ID: {file.get('id')}，檔名: {filename}"
             else:
-                # 3. 若檔案不存在：呼叫 create 新建檔案
+                # 3. 若檔案不存在：使用 create 方法新建並強制掛載在 FOLDER_ID 下
                 file = drive_service.files().create(
                     body=file_metadata,
                     media_body=media,
