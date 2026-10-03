@@ -1045,34 +1045,15 @@ def render_dashboard_view():
         st.markdown(f"#### 📝 {selected_dt.strftime('%Y-%m-%d')} 訂位明細抽屜")
     with drawer_col2:
         if st.button(f"➕ 快速新增 {selected_dt.strftime('%m/%d')} 露營預約", use_container_width=True, type="primary"):
-            st.session_state["show_quick_booking_form"] = True
-            st.session_state["quick_booking_date"] = selected_dt
+            # 無縫跳轉至「新增露營預約」分頁，並自動帶入點選的入住日期
+            st.session_state["selected_booking_date"] = selected_dt
+            st.session_state["jump_to_page"] = "➕ 新增露營預約"
             st.session_state["editing_booking_id"] = None
             st.session_state["editing_booking_data"] = None
-            # 重置表單日期鍵值，確保快速新增帶入點選日期與隔天退房
+            # 重置表單日期鍵值，確保表單載入時正確帶入點選日期與隔天退房
             reset_booking_form_date_keys()
             st.rerun()
             
-    if st.session_state.get("show_quick_booking_form", False):
-        st.markdown(
-            """
-            <div style="padding: 16px; border: 2px solid #2E7D32; border-radius: 12px; background: #F1F8E9; margin-bottom: 20px;">
-                <h4 style="color: #1B5E20; margin-top:0;">🚀 快速新增預約</h4>
-            """,
-            unsafe_allow_html=True,
-        )
-        # 覆蓋按鈕與表單的行為，讓其在提交後關閉並重整
-        if st.button("❌ 取消並收起快速新增表單", key="cancel_quick_booking"):
-            st.session_state["show_quick_booking_form"] = False
-            reset_booking_form_date_keys()
-            st.rerun()
-            
-        # 呼叫表單模組渲染 (需確保表單內的跳轉不會覆蓋)
-        render_booking_form_view(is_quick_mode=True)
-        
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("---")
-        
     mask_selected = (pd.to_datetime(df_all["check_in_date"]).dt.date <= selected_dt) & (pd.to_datetime(df_all["check_out_date"]).dt.date > selected_dt)
     df_selected = df_all[mask_selected]
     
@@ -1448,10 +1429,15 @@ def render_booking_form_view(is_quick_mode: bool = False):
         default_check_in = datetime.strptime(booking_data["check_in_date"], "%Y-%m-%d").date()
         default_check_out = datetime.strptime(booking_data["check_out_date"], "%Y-%m-%d").date()
     else:
-        # 快速預約：自動帶入點選日期 (優先 quick_booking_date，相容 selected_date)
-        quick_date = st.session_state.get("quick_booking_date") or st.session_state.get("selected_date")
+        # 快速預約：自動帶入點選日期 (優先 selected_booking_date，相容 quick_booking_date / selected_date)
+        quick_date = (
+            st.session_state.get("selected_booking_date")
+            or st.session_state.get("quick_booking_date")
+            or st.session_state.get("selected_date")
+        )
         if quick_date:
             default_check_in = quick_date
+            st.session_state["selected_booking_date"] = None
             st.session_state["quick_booking_date"] = None
             if "selected_date" in st.session_state:
                 st.session_state["selected_date"] = None
