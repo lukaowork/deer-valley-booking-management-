@@ -1542,6 +1542,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 st.warning("通舖房間夜衝數量不可大於預約數量！")
 
         col_d1, col_d2 = st.columns(2)
+
         with col_d1:
             check_in_val = st.date_input(
                 "主要入住日期 *",
@@ -1549,37 +1550,38 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 key=FORM_CHECK_IN_KEY,
             )
 
-        # 退房日期精準連動 +1 天 (兩天一夜預設)
-        calc_checkout = check_in_val + timedelta(days=1)
+        # 退房日期最小合規值 (入住日 +1 天，兩天一夜預設)
+        min_checkout = check_in_val + timedelta(days=1)
 
-        # 入住日期變更偵測：自動連動退房日期為入住日 +1 天
-        # (若退房日仍為舊入住日 +1、或尚未手動修改、或已早於新入住日，則自動帶入隔天)
-        # 使用者仍可手動選擇多天後的退房日期 (如 3 天 2 夜)
+        # 入住日期變更同步機制：入住日期改變時，強制更新退房日期為新入住日 +1 天
+        # (註：Streamlit 規範禁止 st.form 內的 widget 使用 on_change 回調，
+        #  否則會拋出 StreamlitInvalidFormCallbackError，故以此同步機制實現相同效果)
         prev_check_in = st.session_state.get(FORM_PREV_CHECK_IN_KEY, None)
         if prev_check_in is not None and check_in_val != prev_check_in:
-            old_auto_check_out = prev_check_in + timedelta(days=1)
-            current_check_out = st.session_state.get(FORM_CHECK_OUT_KEY, None)
-            if (
-                current_check_out == old_auto_check_out
-                or current_check_out is None
-                or current_check_out <= check_in_val
-            ):
-                st.session_state[FORM_CHECK_OUT_KEY] = calc_checkout
+            st.session_state[FORM_CHECK_OUT_KEY] = min_checkout
         st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in_val
 
-        # 修復 StreamlitValueBelowMinError：渲染退房日期選擇器前強制校驗
-        # 若目前退房日期小於 calc_checkout (入住日 +1 天)，自動更新為 calc_checkout
-        # 確保 st.date_input 的 value 絕對不小於 min_value，杜絕報錯
-        current_check_out = st.session_state.get(FORM_CHECK_OUT_KEY, None)
-        effective_check_out = current_check_out if current_check_out is not None else default_check_out
-        if effective_check_out < calc_checkout:
-            st.session_state[FORM_CHECK_OUT_KEY] = calc_checkout
+        # 退房日期 Session State 初始化：首次渲染時以表單預設值建立鍵值
+        # (編輯模式為原訂單退房日，新增/快速新增模式為入住日 +1 天)
+        if FORM_CHECK_OUT_KEY not in st.session_state:
+            st.session_state[FORM_CHECK_OUT_KEY] = default_check_out
+
+        # 防衛邏輯：主動檢查並修復 FORM_CHECK_OUT_KEY 的 Session State
+        # 若其值小於 min_checkout (或小於等於入住日期)，強制更新為 min_checkout
+        # 確保 st.date_input 的 value 絕對不小於 min_value，徹底杜絕 StreamlitValueBelowMinError
+        current_check_out = st.session_state[FORM_CHECK_OUT_KEY]
+        if (
+            current_check_out is None
+            or current_check_out < min_checkout
+            or current_check_out <= check_in_val
+        ):
+            st.session_state[FORM_CHECK_OUT_KEY] = min_checkout
 
         with col_d2:
             check_out_val = st.date_input(
                 "預計退房日期 *",
-                value=default_check_out,
-                min_value=calc_checkout,
+                value=st.session_state.get(FORM_CHECK_OUT_KEY, min_checkout),
+                min_value=min_checkout,
                 key=FORM_CHECK_OUT_KEY,
             )
 
