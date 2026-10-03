@@ -1549,6 +1549,9 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 key=FORM_CHECK_IN_KEY,
             )
 
+        # 退房日期精準連動 +1 天 (兩天一夜預設)
+        calc_checkout = check_in_val + timedelta(days=1)
+
         # 入住日期變更偵測：自動連動退房日期為入住日 +1 天
         # (若退房日仍為舊入住日 +1、或尚未手動修改、或已早於新入住日，則自動帶入隔天)
         # 使用者仍可手動選擇多天後的退房日期 (如 3 天 2 夜)
@@ -1561,14 +1564,22 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 or current_check_out is None
                 or current_check_out <= check_in_val
             ):
-                st.session_state[FORM_CHECK_OUT_KEY] = check_in_val + timedelta(days=1)
+                st.session_state[FORM_CHECK_OUT_KEY] = calc_checkout
         st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in_val
+
+        # 修復 StreamlitValueBelowMinError：渲染退房日期選擇器前強制校驗
+        # 若目前退房日期小於 calc_checkout (入住日 +1 天)，自動更新為 calc_checkout
+        # 確保 st.date_input 的 value 絕對不小於 min_value，杜絕報錯
+        current_check_out = st.session_state.get(FORM_CHECK_OUT_KEY, None)
+        effective_check_out = current_check_out if current_check_out is not None else default_check_out
+        if effective_check_out < calc_checkout:
+            st.session_state[FORM_CHECK_OUT_KEY] = calc_checkout
 
         with col_d2:
             check_out_val = st.date_input(
                 "預計退房日期 *",
                 value=default_check_out,
-                min_value=check_in_val + timedelta(days=1),
+                min_value=calc_checkout,
                 key=FORM_CHECK_OUT_KEY,
             )
 
