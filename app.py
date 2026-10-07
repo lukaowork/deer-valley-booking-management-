@@ -694,6 +694,149 @@ def trigger_auto_sync(operator: str):
 
 
 # ==============================================================================
+# 4-1. Google Sheets 即時同步模組 (gspread)
+# ==============================================================================
+GSHEET_WORKSHEET_TITLE = "訂單紀錄"
+
+# SQLite 欄位 → Google Sheets 中文標頭對照 (與 Excel 匯出欄位一致)
+GSHEET_COLUMN_MAP = {
+    "booking_code": "訂單編號",
+    "check_in_date": "入住日期",
+    "check_out_date": "退房日期",
+    "name": "露營人姓名",
+    "phone": "露營人電話",
+    "area": "預約區域",
+    "quantity": "帳數/間數",
+    "night_rush": "是否夜衝",
+    "night_rush_quantity": "夜衝數量",
+    "night_rush_detail": "夜衝明細",
+    "visit_count": "來過次數",
+    "tag": "客戶標籤",
+    "notes": "備註說明",
+    "total_amount": "總計金額",
+    "created_by": "建立人員",
+    "created_at": "建立時間",
+    "updated_at": "最後更新時間",
+}
+
+
+def get_spreadsheet_id() -> str:
+    """取得 Google Sheets 目標試算表 ID (st.secrets['google_drive']['SPREADSHEET_ID'])"""
+    try:
+        if hasattr(st, "secrets") and "google_drive" in st.secrets:
+            drive_secrets = st.secrets["google_drive"]
+            if isinstance(drive_secrets, dict) and "SPREADSHEET_ID" in drive_secrets:
+                return str(drive_secrets["SPREADSHEET_ID"]).strip()
+    except Exception as e:
+        print(f"[Google Sheets] 讀取 SPREADSHEET_ID 失敗: {e}")
+    return ""
+
+
+@st.cache_resource(show_spinner=False)
+def get_gspread_client():
+    """建立 Google Sheets API 連線客戶端 (gspread) 並快取，避免每次重新認證
+
+    認證來源：優先 st.secrets['gcp_service_account']，其次本機 data/service_account.json；
+    連線後會透過 open_by_key 驗證目標試算表可存取。
+    """
+    from google.oauth2 import service_account
+    import gspread
+
+    creds = None
+    # 認證來源 1: Streamlit Secrets
+    if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+        try:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            creds = service_account.Credentials.from_service_account_info(
+                creds_info,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+            )
+        except Exception as e:
+            print(f"[Google Sheets] Secrets 認證失敗: {e}")
+
+    # 認證來源 2: 本機 service_account.json (本地開發環境)
+    if creds is None and os.path.exists(SERVICE_ACCOUNT_PATH):
+        try:
+            creds = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_PATH,
+                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+            )
+        except Exception as e:
+            print(f"[Google Sheets] 本機憑證認證失敗: {e}")
+
+    if creds is None:
+        raise RuntimeError(
+            "找不到 Google Service Account 憑證，請設定 st.secrets['gcp_service_account'] 或放置 data/service_account.json"
+        )
+
+    spreadsheet_id = get_spreadsheet_id()
+    if not spreadsheet_id:
+        raise RuntimeError("找不到目標試算表 ID，請設定 st.secrets['google_drive']['SPREADSHEET_ID']")
+
+    client = gspread.authorize(creds)
+    # 連線至指定試算表並驗證可存取性
+    client.open_by_key(spreadsheet_id)
+    return client
+
+
+def sync_db_to_google_sheet() -> bool:
+    """將 SQLite bookings 資料表全量同步至 Google Sheets 指定工作表
+
+    流程：讀取最新完整訂單 DataFrame → 全欄位轉字串 → 清除工作表舊資料 → 一次性覆寫標頭與資料列。
+    同步失敗僅顯示警告訊息，不影響 SQLite 原本的寫入流程。
+    """
+    try:
+        client = get_gspread_client()
+        spreadsheet_id = get_spreadsheet_id()
+        spreadsheet = client.open_by_key(spreadsheet_id)
+
+        # 讀取 SQLite 最新完整訂單資料
+        conn = get_db_connection()
+        df = pd.read_sql_query(
+            """
+            SELECT booking_code, check_in_date, check_out_date, name, phone, area,
+                   quantity, night_rush, night_rush_quantity, night_rush_detail,
+                   visit_count, tag, notes, total_amount, created_by, created_at, updated_at
+            FROM bookings
+            ORDER BY check_in_date DESC
+            """,
+            conn,
+        )
+        conn.close()
+
+        # 空值以空字串表示，並將所有欄位 (含日期/時間/數字) 全數轉換為字串格式
+        df = df.fillna("").astype(str)
+
+        # 取得目標工作表；若不存在則自動建立
+        worksheet = None
+        for ws in spreadsheet.worksheets():
+            if ws.title == GSHEET_WORKSHEET_TITLE:
+                worksheet = ws
+                break
+        if worksheet is None:
+            worksheet = spreadsheet.add_worksheet(
+                title=GSHEET_WORKSHEET_TITLE,
+                rows=1000,
+                cols=len(GSHEET_COLUMN_MAP),
+            )
+
+        # 組合中文標頭與資料列
+        df = df.rename(columns=GSHEET_COLUMN_MAP)
+        header = [str(column) for column in df.columns]
+        data = [header] + df.values.tolist()
+
+        # 清除工作表舊資料並一次性覆寫，確保 Google Sheets 與 SQLite 資料完全一致
+        worksheet.clear()
+        worksheet.update(range_name="A1", values=data)
+
+        st.toast(f"☁️ Google Sheets 同步完成，共 {len(df)} 筆訂單", icon="✅")
+        return True
+    except Exception as e:
+        st.warning(f"⚠️ Google Sheets 即時同步失敗（SQLite 資料不受影響）：{e}")
+        return False
+
+
+# ==============================================================================
 # 5. 自定義 CSS 樣式與頁面配置
 # ==============================================================================
 def apply_custom_styles():
@@ -1136,6 +1279,8 @@ def render_dashboard_view():
                         del_conn.commit()
                         del_conn.close()
                         st.cache_data.clear()
+                        # SQLite 寫入成功後，即時同步至 Google Sheets
+                        sync_db_to_google_sheet()
                         add_audit_log(
                             current_user,
                             "刪除訂單",
@@ -1356,6 +1501,8 @@ def render_bookings_view():
                                 del_conn.close()
 
                                 st.cache_data.clear()
+                                # SQLite 寫入成功後，即時同步至 Google Sheets
+                                sync_db_to_google_sheet()
                                 add_audit_log(
                                     current_user,
                                     "刪除訂單",
@@ -1677,6 +1824,8 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         )
                         conn.commit()
                         st.cache_data.clear()
+                        # SQLite 寫入成功後，即時同步至 Google Sheets
+                        sync_db_to_google_sheet()
                         add_audit_log(
                             current_user,
                             "修改訂單",
@@ -1723,6 +1872,8 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         )
                         conn.commit()
                         st.cache_data.clear()
+                        # SQLite 寫入成功後，即時同步至 Google Sheets
+                        sync_db_to_google_sheet()
                         add_audit_log(
                             current_user,
                             "新增訂單",
@@ -2046,6 +2197,8 @@ def render_import_export_view():
                     conn.close()
 
                     st.cache_data.clear()
+                    # SQLite 寫入成功後，即時同步至 Google Sheets
+                    sync_db_to_google_sheet()
                     add_audit_log(
                         current_user,
                         "批次匯入訂單",
