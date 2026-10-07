@@ -36,17 +36,23 @@ DEFAULT_GDRIVE_FOLDER_ID = DVCG_FOLDER_ID
 
 
 def get_gdrive_folder_id() -> str:
-    """取得 Google Drive 目標資料夾 ID (依序檢查 st.secrets 與環境變數，預設回退至 DVCG_FOLDER_ID)"""
+    """取得 Google Drive 目標資料夾 ID (依序檢查 st.secrets 與環境變數，預設回退至 DVCG_FOLDER_ID)
+
+    (註：st.secrets 巢狀區段回傳 AttrDict，屬 Mapping 而非 dict 子類別，
+     故直接以 in / [] 存取，不可使用 isinstance(..., dict) 判斷)
+    """
     try:
         if hasattr(st, "secrets"):
             # 優先嘗試 1: st.secrets["google_drive"]["folder_id"]
-            if "google_drive" in st.secrets and isinstance(st.secrets["google_drive"], dict):
-                if "folder_id" in st.secrets["google_drive"]:
-                    return str(st.secrets["google_drive"]["folder_id"]).strip()
+            if "google_drive" in st.secrets:
+                drive_section = st.secrets["google_drive"]
+                if "folder_id" in drive_section:
+                    return str(drive_section["folder_id"]).strip()
             # 嘗試 2: st.secrets["gcp_service_account"]["folder_id"]
-            if "gcp_service_account" in st.secrets and isinstance(st.secrets["gcp_service_account"], dict):
-                if "folder_id" in st.secrets["gcp_service_account"]:
-                    return str(st.secrets["gcp_service_account"]["folder_id"]).strip()
+            if "gcp_service_account" in st.secrets:
+                sa_section = st.secrets["gcp_service_account"]
+                if "folder_id" in sa_section:
+                    return str(sa_section["folder_id"]).strip()
             # 嘗試 3: 其他常見單層 Secrets
             if "gdrive_folder_id" in st.secrets:
                 return str(st.secrets["gdrive_folder_id"]).strip()
@@ -796,12 +802,23 @@ GSHEET_COLUMN_MAP = {
 
 
 def get_spreadsheet_id() -> str:
-    """取得 Google Sheets 目標試算表 ID (st.secrets['google_drive']['SPREADSHEET_ID'])"""
+    """取得 Google Sheets 目標試算表 ID
+
+    防呆讀取：依序檢查 st.secrets 的 [google_drive] 或 [google_sheets] 區段，
+    並支援 SPREADSHEET_ID / spreadsheet_id 大寫或小寫鍵名。
+    (註：st.secrets 巢狀區段回傳 AttrDict，屬 Mapping 而非 dict 的子類別，
+     因此不可用 isinstance(..., dict) 判斷，否則在真實 Streamlit 環境永遠讀取失敗)
+    """
     try:
-        if hasattr(st, "secrets") and "google_drive" in st.secrets:
-            drive_secrets = st.secrets["google_drive"]
-            if isinstance(drive_secrets, dict) and "SPREADSHEET_ID" in drive_secrets:
-                return str(drive_secrets["SPREADSHEET_ID"]).strip()
+        if hasattr(st, "secrets"):
+            # 嘗試從 [google_drive] 或 [google_sheets] 讀取大寫或小寫的 ID
+            drive_secrets = st.secrets.get("google_drive", st.secrets.get("google_sheets", {}))
+            spreadsheet_id = drive_secrets.get("SPREADSHEET_ID") or drive_secrets.get("spreadsheet_id")
+
+            if not spreadsheet_id:
+                print("[Google Sheets] 未設定試算表 ID，請檢查 .streamlit/secrets.toml")
+                return ""
+            return str(spreadsheet_id).strip()
     except Exception as e:
         print(f"[Google Sheets] 讀取 SPREADSHEET_ID 失敗: {e}")
     return ""
@@ -846,7 +863,9 @@ def get_gspread_client():
 
     spreadsheet_id = get_spreadsheet_id()
     if not spreadsheet_id:
-        raise RuntimeError("找不到目標試算表 ID，請設定 st.secrets['google_drive']['SPREADSHEET_ID']")
+        raise RuntimeError(
+            "找不到目標試算表 ID，請設定 st.secrets['google_drive']['SPREADSHEET_ID'] 或 st.secrets['google_sheets']['spreadsheet_id']"
+        )
 
     client = gspread.authorize(creds)
     # 連線至指定試算表並驗證可存取性
@@ -921,7 +940,8 @@ def backup_database_to_google_sheets_full() -> Tuple[bool, str]:
     try:
         spreadsheet_id = get_spreadsheet_id()
         if not spreadsheet_id:
-            return False, "未設定 Google Sheets 試算表 ID (st.secrets['google_drive']['SPREADSHEET_ID'])"
+            st.error("⚠️ 未設定 Google Sheets 試算表 ID，請檢查 .streamlit/secrets.toml！")
+            return False, "未設定 Google Sheets 試算表 ID，請檢查 .streamlit/secrets.toml 設定"
 
         client = get_gspread_client()
         spreadsheet = client.open_by_key(spreadsheet_id)
