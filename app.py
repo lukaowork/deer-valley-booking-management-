@@ -4,7 +4,7 @@
 - 營區區域：雨棚區 (8帳)、草地區 (4帳)、通舖房間 (2間)
 - 安全機制：4 位數 PIN 碼登入與管理員權限控制
 - 核心功能：訂位管理、三大核心索引搜尋、Excel/CSV 匯入匯出、操作稽核日誌 (Audit Log)
-- 雲端備份：Google Drive API 自動同步備份 (預設目標 DVCG 資料夾)，具備平滑降級本地機制
+- 雲端備份：Google Sheets 完整資料庫轉譯備份 (DB_Full_Backup 分頁)，具備平滑降級本地機制
 """
 
 import io
@@ -704,7 +704,11 @@ class GoogleDriveSync:
 
     def backup_database_now(self, operator: str = "系統") -> Tuple[bool, str]:
         """
-        將目前所有訂單與 Log 打包匯出成 Excel 與 JSON，並嘗試同步到 Google Drive 與本地備份區
+        資料庫備份：
+        - 本地備份：Excel 檔案存至 data/ 備份目錄
+        - 雲端備份：採「Google Sheets 完整資料庫轉譯備份」(DB_Full_Backup 分頁)
+          (個人版 Google Drive 的 Service Account 預設無儲存配額，無法作為檔案
+           擁有者上傳實體檔案，故不再呼叫 Drive API，改以 gspread 寫入試算表)
         """
         try:
             conn = get_db_connection()
@@ -727,23 +731,15 @@ class GoogleDriveSync:
             with open(local_backup_path, "wb") as f:
                 f.write(excel_bytes)
 
-            # 嘗試 Google Drive 雲端同步 (優先以「祿野營地資料庫最新備份.xlsx」常駐更新)
-            if self.is_connected:
-                latest_cloud_filename = "祿野營地資料庫最新備份.xlsx"
-                success, msg = self.upload_to_google_drive(
-                    excel_bytes,
-                    latest_cloud_filename,
-                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-                if success:
-                    add_audit_log(operator, "雲端同步備份", f"已成功同步至 Google Drive (DVCG 資料夾)：{latest_cloud_filename}")
-                    return True, f"雲端同步備份成功！本地亦已保存副本。\n{msg}"
-                else:
-                    add_audit_log(operator, "雲端同步異常", f"雲端上傳失敗，已保存在本地備份：{local_backup_path}")
-                    return False, f"本地備份成功，但雲端備份失敗：{msg}"
+            # 雲端備份：Google Sheets 完整資料庫轉譯 (取代 Drive API 實體檔案上傳)
+            success, msg = backup_database_to_google_sheets_full()
+            if success:
+                add_audit_log(operator, "雲端同步備份", f"已成功同步至 Google Sheets「{DB_FULL_BACKUP_WORKSHEET_TITLE}」分頁")
+                st.toast("✅ 本地資料庫與雲端 Google Sheets 完整備份成功！")
+                return True, f"本地與雲端備份皆成功！\n雲端：{msg}\n本地：{local_backup_path}"
             else:
-                add_audit_log(operator, "本地備份", f"雲端未啟用，已生成本地備份：{local_backup_path}")
-                return True, f"本地資料備份成功！（已儲存至 {local_backup_path}）。因未配置 Google 憑證，雲端同步處於離線狀態。"
+                add_audit_log(operator, "雲端同步異常", f"雲端備份失敗，已保存在本地備份：{local_backup_path}")
+                return False, f"本地備份成功，但雲端 Google Sheets 備份失敗：{msg}"
         except Exception as e:
             return False, f"備份過程發生錯誤: {str(e)}"
 
@@ -775,6 +771,7 @@ def trigger_auto_sync(operator: str):
 # 4-1. Google Sheets 即時同步模組 (gspread)
 # ==============================================================================
 GSHEET_WORKSHEET_TITLE = "訂單紀錄"
+DB_FULL_BACKUP_WORKSHEET_TITLE = "DB_Full_Backup"
 
 # SQLite 欄位 → Google Sheets 中文標頭對照 (與 Excel 匯出欄位一致)
 GSHEET_COLUMN_MAP = {
@@ -912,6 +909,71 @@ def sync_db_to_google_sheet() -> bool:
     except Exception as e:
         st.warning(f"⚠️ Google Sheets 即時同步失敗（SQLite 資料不受影響）：{e}")
         return False
+
+
+def backup_database_to_google_sheets_full() -> Tuple[bool, str]:
+    """將 SQLite 完整資料庫轉譯並覆寫寫入 Google Sheets 的 DB_Full_Backup 分頁
+
+    讀取所有資料表 (bookings、audit_logs 等)，以「表名標題 → 欄位名稱 → 全部資料列」
+    的完整表格格式依序寫入，取代實體檔案上傳
+    (個人版 Google Drive 的 Service Account 預設無儲存配額，無法作為檔案擁有者上傳)。
+    """
+    try:
+        spreadsheet_id = get_spreadsheet_id()
+        if not spreadsheet_id:
+            return False, "未設定 Google Sheets 試算表 ID (st.secrets['google_drive']['SPREADSHEET_ID'])"
+
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(spreadsheet_id)
+
+        # 讀取 SQLite 所有資料表 (排除 SQLite 內部表)
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+        table_names = [row[0] for row in cursor.fetchall()]
+
+        # 組合完整表格資料：每個資料表依序寫入 [表名標題列 / 欄位名稱列 / 資料列 / 空行分隔]
+        data_rows: List[List[str]] = []
+        for table_name in table_names:
+            cursor.execute(f'SELECT * FROM "{table_name}"')
+            columns = [str(desc[0]) for desc in cursor.description]
+            rows = cursor.fetchall()
+
+            data_rows.append([f"📦 資料表：{table_name} (共 {len(rows)} 列)"])
+            data_rows.append(columns)
+            for row in rows:
+                data_rows.append(["" if value is None else str(value) for value in row])
+            data_rows.append([])  # 空行分隔
+        conn.close()
+
+        if not data_rows:
+            data_rows = [["(資料庫目前無任何資料表)"]]
+
+        # 取得或建立 DB_Full_Backup 工作表
+        worksheet = None
+        for ws in spreadsheet.worksheets():
+            if ws.title == DB_FULL_BACKUP_WORKSHEET_TITLE:
+                worksheet = ws
+                break
+        if worksheet is None:
+            worksheet = spreadsheet.add_worksheet(
+                title=DB_FULL_BACKUP_WORKSHEET_TITLE,
+                rows=max(1000, len(data_rows) + 100),
+                cols=40,
+            )
+        elif worksheet.row_count < len(data_rows) + 10:
+            # 資料量成長超過既有工作表容量時自動擴容，避免寫入失敗
+            worksheet.resize(rows=len(data_rows) + 100, cols=max(40, worksheet.col_count))
+
+        # 清除舊資料並一次性覆寫，確保 Google Sheets 與 SQLite 資料庫完全一致
+        worksheet.clear()
+        worksheet.update(range_name="A1", values=data_rows)
+
+        return True, f"已將 {len(table_names)} 個資料表完整轉譯至 Google Sheets「{DB_FULL_BACKUP_WORKSHEET_TITLE}」分頁"
+    except Exception as e:
+        return False, str(e)
 
 
 # ==============================================================================
@@ -2414,8 +2476,8 @@ def render_admin_management_view():
 # 13. 頁面功能：Google Drive 雲端同步與備份狀態 (Cloud Sync)
 # ==============================================================================
 def render_cloud_sync_view():
-    st.markdown("### ☁️ Google Drive 雲端同步與備份中心")
-    st.write("設定與檢視 Google Drive 備份狀態。每次資料有新增、修改或刪除時，系統均會觸發自動備份機制。")
+    st.markdown("### ☁️ 雲端同步與完整備份中心 (Google Sheets)")
+    st.write("設定與檢視雲端備份狀態。每次資料有新增、修改或刪除時，系統均會觸發自動備份機制 (完整資料庫轉譯至 Google Sheets DB_Full_Backup 分頁)。")
 
     sync_tool = get_gdrive_sync()
     current_user = st.session_state.get("authenticated_user", "管理員")
@@ -2423,15 +2485,24 @@ def render_cloud_sync_view():
     sa_email = get_service_account_email()
     sa_email_display = f"<code>{sa_email}</code>" if sa_email else "<code>未偵測到 (可於右側上傳 service_account.json)</code>"
 
+    # 偵測 Google Sheets 雲端備份連線狀態
+    try:
+        get_gspread_client()
+        sheets_status_html = '<span style="color:#2E7D32; font-weight:700;">🟢 已連線正常</span>'
+        sheets_detail = f"目標試算表 ID：<code>{get_spreadsheet_id()}</code>"
+    except Exception as e:
+        sheets_status_html = '<span style="color:#E65100; font-weight:700;">🟡 未連線 (僅本地備份模式)</span>'
+        sheets_detail = f"連線說明：{e}"
+
     st.markdown(
         f"""
         <div class="luye-card">
-            <h4>📁 Google Drive 對接資訊</h4>
+            <h4>☁️ 雲端備份對接資訊 (Google Sheets)</h4>
             <ul>
-                <li><b>目標資料夾 ID</b>：<code>{sync_tool.folder_id}</code> (資料夾名稱：DVCG)</li>
-                <li><b>雲端連線狀態</b>：{'<span style="color:#2E7D32; font-weight:700;">🟢 已連線正常</span>' if sync_tool.is_connected else '<span style="color:#E65100; font-weight:700;">🟡 本地儲存模式 (離線平滑降級)</span>'}</li>
-                <li><b>服務帳號信箱</b>：{sa_email_display} <span style="color:#5F6368;">(若上傳失敗提示儲存配額，請將備份檔案分享給此信箱)</span></li>
-                <li><b>詳細連線說明</b>：{sync_tool.status_message}</li>
+                <li><b>備份目標</b>：Google Sheets 試算表的 <code>{DB_FULL_BACKUP_WORKSHEET_TITLE}</code> 分頁 (完整資料庫轉譯備份)</li>
+                <li><b>雲端連線狀態</b>：{sheets_status_html}</li>
+                <li><b>服務帳號信箱</b>：{sa_email_display} <span style="color:#5F6368;">(請確認目標試算表已分享編輯權限給此信箱)</span></li>
+                <li><b>詳細連線說明</b>：{sheets_detail}</li>
             </ul>
         </div>
         """,
@@ -2441,7 +2512,7 @@ def render_cloud_sync_view():
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("#### ⚡ 立即執行備份")
-        st.write("手動打包所有訂單與 Audit Log，產出最新 Excel 副本並同步至雲端與本地備份目錄。")
+        st.write("手動打包所有訂單與 Audit Log 存至本地，並將完整資料庫轉譯備份至 Google Sheets「DB_Full_Backup」分頁。")
         if st.button("🚀 立即手動同步與備份", type="primary", use_container_width=True):
             with st.spinner("正在進行資料備份中..."):
                 success, msg = sync_tool.backup_database_now(operator=current_user)
@@ -2452,7 +2523,7 @@ def render_cloud_sync_view():
 
     with c2:
         st.markdown("#### 🔑 Google Service Account 金鑰設定")
-        st.write("若欲啟用 Google Drive 雲端自動上傳，請上傳具備存取權限的 `service_account.json` 憑證檔：")
+        st.write("若欲啟用 Google Sheets 雲端備份，請上傳具備存取權限的 `service_account.json` 憑證檔 (並請將目標試算表分享編輯權限給服務帳號信箱)：")
         sa_file = st.file_uploader("上傳 service_account.json", type=["json"])
         if sa_file is not None:
             if st.button("安裝憑證並重新連線"):
