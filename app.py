@@ -59,6 +59,27 @@ def get_gdrive_folder_id() -> str:
     return os.environ.get("GDRIVE_FOLDER_ID", os.environ.get("FOLDER_ID", DVCG_FOLDER_ID)).strip()
 
 
+def get_service_account_email() -> str:
+    """取得 Service Account 的 client_email
+
+    用途：Service Account 預設沒有 Drive 儲存配額，無法新建檔案；
+    需將目標備份檔案预先分享給此信箱 (編輯者權限)，系統才能以覆寫方式同步。
+    """
+    try:
+        if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            sa_info = dict(st.secrets["gcp_service_account"])
+            if isinstance(sa_info, dict) and "client_email" in sa_info:
+                return str(sa_info["client_email"]).strip()
+        if os.path.exists(SERVICE_ACCOUNT_PATH):
+            with open(SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as f:
+                sa_info = json.load(f)
+            if isinstance(sa_info, dict) and "client_email" in sa_info:
+                return str(sa_info["client_email"]).strip()
+    except Exception as e:
+        print(f"[Service Account] 讀取 client_email 失敗: {e}")
+    return ""
+
+
 # 全域 FOLDER_ID (供備份模組調用)
 FOLDER_ID = get_gdrive_folder_id()
 
@@ -569,20 +590,31 @@ class GoogleDriveSync:
 
     def upload_to_google_drive(self, file_content_bytes: bytes, filename: str, mime_type: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") -> Tuple[bool, str]:
         """
-        上傳檔案至目標 Google Drive 資料夾 (DVCG)，徹底解決 HttpError 403 (storageQuotaExceeded) 錯誤：
-        1. 在 metadata 中明確傳入 parents 參數指向 DVCG 資料夾
-        2. 採「既有檔案覆蓋 (Update) / 新建 (Create)」雙軌防呆機制
+        上傳檔案至目標 Google Drive 資料夾 (DVCG)。
+
+        針對 Service Account 無 Drive 儲存配額的問題
+        (HttpError 403: Service Accounts do not have storage quota)：
+        1. file_metadata 明確指定 parents 為目標資料夾 (st.secrets['google_drive']['folder_id'])
+        2. 優先「既有檔案覆蓋 (Update)」：覆寫舊檔不消耗新的儲存配額
+        3. 資料夾內找不到時，全 Drive 搜尋同名舊檔 (含早期建立在根目錄的檔案)，
+           覆寫內容並搬移 (addParents/removeParents) 至目標資料夾
+        4. 皆找不到才新建檔；若新建遭遇配額錯誤，回傳明確處理指引
         """
         if not self.is_connected or not self.service:
             return False, f"Google Drive 未連線：{self.status_message}"
 
+        # 目標資料夾 ID：優先取用 st.secrets['google_drive']['folder_id']，
+        # 其餘來源 (gcp_service_account.folder_id / 環境變數 / DVCG 預設) 由 get_gdrive_folder_id() 支援
         FOLDER_ID = self.folder_id or get_gdrive_folder_id()
         drive_service = self.service
 
         try:
             from googleapiclient.http import MediaIoBaseUpload
 
-            media = MediaIoBaseUpload(io.BytesIO(file_content_bytes), mimetype=mime_type, resumable=True)
+            def _build_media():
+                return MediaIoBaseUpload(io.BytesIO(file_content_bytes), mimetype=mime_type, resumable=True)
+
+            media = _build_media()
 
             # 1. 上傳前先查詢 DVCG 資料夾內是否已存在同名檔案
             escaped_name = filename.replace("'", "\\'")
@@ -595,29 +627,75 @@ class GoogleDriveSync:
             ).execute()
             items = response.get("files", [])
 
+            # 上傳元資料：務必明確指定 parents，確保檔案直接建立在共用資料夾內部
             file_metadata = {
                 "name": filename,
                 "parents": [FOLDER_ID],
             }
 
             if len(items) > 0:
-                # 2. 若檔案已存在 (len(items) > 0)：使用 update 方法覆蓋舊檔 (避免 Service Account 儲存配額問題)
+                # 2. 資料夾內已存在：使用 update 覆蓋舊檔 (不消耗 Service Account 儲存配額)
                 file = drive_service.files().update(
                     fileId=items[0]["id"],
                     media_body=media,
                     supportsAllDrives=True,
                 ).execute()
                 return True, f"檔案已成功覆蓋更新至雲端！檔案 ID: {file.get('id')}，檔名: {filename}"
-            else:
-                # 3. 若檔案不存在：使用 create 方法新建並強制掛載在 FOLDER_ID 下
-                file = drive_service.files().create(
-                    body=file_metadata,
-                    media_body=media,
-                    supportsAllDrives=True,
-                    fields="id, name, webViewLink",
-                ).execute()
-                return True, f"檔案成功備份至雲端！檔案 ID: {file.get('id')}，檔名: {filename}"
+
+            # 3. 資料夾內找不到：全 Drive 搜尋同名檔 (處理早期建立在根目錄的舊檔)
+            global_query = f"name = '{escaped_name}' and trashed = false"
+            global_response = drive_service.files().list(
+                q=global_query,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+                fields="files(id, name, parents, webViewLink)",
+            ).execute()
+            global_items = global_response.get("files", [])
+
+            if len(global_items) > 0:
+                existing = global_items[0]
+                existing_id = existing["id"]
+                old_parents = existing.get("parents") or []
+                move_params = {}
+                if FOLDER_ID not in old_parents:
+                    move_params["addParents"] = FOLDER_ID
+                    if old_parents:
+                        move_params["removeParents"] = ",".join(old_parents)
+                try:
+                    # 覆寫內容並搬移至 DVCG 資料夾 (搬移檔案不消耗配額)
+                    file = drive_service.files().update(
+                        fileId=existing_id,
+                        media_body=media,
+                        supportsAllDrives=True,
+                        **move_params,
+                    ).execute()
+                    return True, f"檔案已覆寫並搬移至 DVCG 資料夾！檔案 ID: {file.get('id')}，檔名: {filename}"
+                except Exception:
+                    # 搬移失敗時退而只覆寫內容 (保留原位置，至少確保備份內容正確)
+                    fallback_media = _build_media()
+                    file = drive_service.files().update(
+                        fileId=existing_id,
+                        media_body=fallback_media,
+                        supportsAllDrives=True,
+                    ).execute()
+                    return True, f"檔案已覆寫更新至雲端 (保留原資料夾位置)！檔案 ID: {file.get('id')}，檔名: {filename}"
+
+            # 4. 完全不存在：建立新檔並強制掛載在 FOLDER_ID 下
+            file = drive_service.files().create(
+                body=file_metadata,
+                media_body=media,
+                supportsAllDrives=True,
+                fields="id, name, webViewLink",
+            ).execute()
+            return True, f"檔案成功備份至雲端！檔案 ID: {file.get('id')}，檔名: {filename}"
         except Exception as e:
+            error_text = str(e).lower()
+            if "quota" in error_text:
+                return False, (
+                    f"上傳至 Google Drive 失敗：Service Account 沒有 Drive 儲存配額，無法新建檔案。"
+                    f"請先手動在 DVCG 資料夾內建立「{filename}」，並將該檔案分享給服務帳號信箱"
+                    "(編輯者權限) 後再試；或将備份資料夾設為 Shared Drive 以使用組織儲存空間。"
+                )
             return False, f"上傳至 Google Drive 失敗: {str(e)}"
 
     # 方法別名以相容既有呼叫
@@ -2342,6 +2420,9 @@ def render_cloud_sync_view():
     sync_tool = get_gdrive_sync()
     current_user = st.session_state.get("authenticated_user", "管理員")
 
+    sa_email = get_service_account_email()
+    sa_email_display = f"<code>{sa_email}</code>" if sa_email else "<code>未偵測到 (可於右側上傳 service_account.json)</code>"
+
     st.markdown(
         f"""
         <div class="luye-card">
@@ -2349,6 +2430,7 @@ def render_cloud_sync_view():
             <ul>
                 <li><b>目標資料夾 ID</b>：<code>{sync_tool.folder_id}</code> (資料夾名稱：DVCG)</li>
                 <li><b>雲端連線狀態</b>：{'<span style="color:#2E7D32; font-weight:700;">🟢 已連線正常</span>' if sync_tool.is_connected else '<span style="color:#E65100; font-weight:700;">🟡 本地儲存模式 (離線平滑降級)</span>'}</li>
+                <li><b>服務帳號信箱</b>：{sa_email_display} <span style="color:#5F6368;">(若上傳失敗提示儲存配額，請將備份檔案分享給此信箱)</span></li>
                 <li><b>詳細連線說明</b>：{sync_tool.status_message}</li>
             </ul>
         </div>
