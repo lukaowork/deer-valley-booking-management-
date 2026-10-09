@@ -2327,28 +2327,26 @@ def render_booking_form_view(is_quick_mode: bool = False):
         )
 
         if submit_btn:
-            # 檢核必要欄位
+            # 1. Input Validations
             if not name_val.strip():
-                st.error("請填寫露營人姓名！")
+                st.error("❌ 請填寫露營人姓名！")
             elif not phone_val.strip():
-                st.error("請填寫露營人電話！")
+                st.error("❌ 請填寫露營人電話！")
             elif total_qty == 0:
-                st.error("請至少選擇一個區域並輸入數量！")
+                st.error("❌ 請至少選擇一個區域並輸入數量！")
             elif check_out_val <= check_in_val:
-                st.error("退房日期必須在入住日期之後！")
+                st.error("❌ 退房日期必須在入住日期之後！")
             else:
                 current_user = st.session_state.get("authenticated_user", "管理員")
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                has_night_rush = 1 if has_night_rush else 0
-
-                # 開啟單一資料庫連線，確保交易原子性
-                conn = get_db_connection()
-                cursor = conn.cursor()
-                save_ok = False
+                has_night_rush_flag = 1 if has_night_rush else 0
 
                 try:
+                    conn = get_db_connection()
+                    cursor = conn.cursor()
+
                     if is_editing:
-                        # 更新現有訂單 (全欄位)
+                        # 2A. Clear & Explicit Update
                         cursor.execute(
                             """
                             UPDATE bookings
@@ -2364,7 +2362,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 phone_val.strip(),
                                 area_val,
                                 total_qty,
-                                has_night_rush,
+                                has_night_rush_flag,
                                 int(total_rush_qty),
                                 rush_val,
                                 visit_count_val,
@@ -2375,16 +2373,14 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 editing_id,
                             ),
                         )
-                        # 查詢執行後立即提交交易
                         conn.commit()
                         add_audit_log(
                             current_user,
                             "修改訂單",
-                            f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 總額: {calc_total})",
+                            f"修改訂單 ID {editing_id} (客戶: {name_val}, 區域: {area_val}, 總金額: {calc_total})",
                         )
-                        save_ok = True
                     else:
-                        # 新增訂單
+                        # 2B. Insert New Order
                         b_code = generate_booking_code(check_in_val)
                         cursor.execute(
                             """
@@ -2402,7 +2398,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 phone_val.strip(),
                                 area_val,
                                 total_qty,
-                                has_night_rush,
+                                has_night_rush_flag,
                                 int(total_rush_qty),
                                 rush_val,
                                 visit_count_val,
@@ -2414,39 +2410,32 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 now_str,
                             ),
                         )
-                        # 查詢執行後立即提交交易
                         conn.commit()
                         add_audit_log(
                             current_user,
                             "新增訂單",
-                            f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 入住: {check_in_val}, 金額: {calc_total})",
+                            f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 金額: {calc_total})",
                         )
-                        save_ok = True
-                except Exception as e:
-                    st.error(f"儲存訂單時發生錯誤: {e}")
 
-                # 交易完成後才關閉連線，確保 SQLite 寫入已持久化
-                conn.close()
+                    conn.close()
 
-                if save_ok:
-                    # 清除快取並重整本地資料集
+                    # 3. Cache & Sync Refinement
                     st.cache_data.clear()
                     refresh_session_state_data()
-                    # 推送同步 Google Sheets
                     sync_db_to_google_sheet()
-                    # 重置編輯狀態
+                    trigger_auto_sync(current_user)
+
+                    # 4. Clean State & UI Feedback
                     st.session_state["editing_booking_id"] = None
                     st.session_state["editing_booking_data"] = None
                     reset_booking_form_date_keys()
-                    # 成功通知
-                    if is_editing:
-                        st.toast("✅ 訂單資料已成功修改並同步！", icon="🎉")
-                        time.sleep(3)
-                    else:
-                        st.toast(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}", icon="🎉")
-                    # 觸發自動備份並立即重跑 (最後一刻才重跑)
-                    trigger_auto_sync(current_user)
+
+                    st.toast("✅ 訂單已成功儲存並同步至 Google Sheets！", icon="🎉")
                     st.rerun()
+
+                except Exception as e:
+                    st.error(f"⚠️ 儲存資料庫時發生嚴重錯誤: {str(e)}")
+                    print(f"[Form Submit Error] {str(e)}")
 
 
 # ==============================================================================
