@@ -559,8 +559,8 @@ def deduplicate_bookings() -> int:
     """啟動時自動清理 bookings 表中的重複訂單
 
     依複合鍵 (入住日期 check_in_date, 露營人姓名 name,
-    露營人電話 phone) 分組，每組僅保留 id 最小
-    (最早建立) 的記錄，刪除其餘重複項。
+    露營人電話 phone) 分組，每組僅保留 id 最大
+    (最近建立/最新版本) 的記錄，刪除其餘重複項。
 
     回傳刪除的重複筆數 (0 表示無重複)；失敗時回傳 -1，
     不影響啟動流程。
@@ -572,7 +572,7 @@ def deduplicate_bookings() -> int:
             """
             DELETE FROM bookings
             WHERE id NOT IN (
-                SELECT MIN(id)
+                SELECT MAX(id)
                 FROM bookings
                 GROUP BY check_in_date, name, phone
             )
@@ -583,11 +583,11 @@ def deduplicate_bookings() -> int:
         conn.close()
 
         if deleted > 0:
-            print(f"[Dedup] 啟動自動去重：刪除重複訂單 {deleted} 筆")
+            print(f"[Dedup] 啟動自動去重：刪除重複訂單 {deleted} 筆 (保留最新版本)")
             add_audit_log(
                 "系統",
                 "自動去重清理",
-                f"啟動時依 (入住日期, 姓名, 電話) 複合鍵自動清理重複訂單 {deleted} 筆",
+                f"啟動時依 (入住日期, 姓名, 電話) 複合鍵自動清理重複訂單 {deleted} 筆，僅保留最新版本",
             )
         return deleted
     except Exception as e:
@@ -1042,16 +1042,17 @@ def _normalize_int(value: Any, default: int = 0) -> int:
 
 
 def pull_google_sheet_to_db() -> Tuple[int, int]:
-    """從 Google Sheets「訂單紀錄」分頁拉取訂單，經嚴格去重後匯入本機 SQLite
+    """從 Google Sheets「訂單紀錄」分頁拉取訂單，以最新資料覆寫本機 SQLite
 
-    去重規則 (複合唯一約束)：入住日期 (check_in_date) + 露營人姓名 (name) +
-    露營人電話 (phone) 三者完全一致即視為同一筆訂單，跳過插入；
-    僅將 SQLite 不存在的新訂單寫入資料庫並更新 st.session_state。
+    覆寫規則 (複合鍵)：入住日期 (check_in_date) + 露營人姓名 (name) +
+    露營人電話 (phone) 三者完全一致即視為同一筆訂單；
+    雲端列代表最新更新 (區域/備註/客戶資料等)，故先刪除
+    SQLite 既有舊記錄再插入最新版本。
 
     比對前會先標準化欄位格式 (去除空白、電話去符號、日期統一為
     YYYY-MM-DD)，以容忍 Sheets 與 SQLite 之間的格式差異。
 
-    回傳 (新增筆數, 跳過重複筆數)；試算表不可達或憑證缺失等任何失敗
+    回傳 (寫入筆數, 跳過無效列數)；試算表不可達或憑證缺失等任何失敗
     均僅背景記錄日誌並回傳 (0, 0)，不會中斷 UI 流程。
     """
     try:
@@ -1099,19 +1100,21 @@ def pull_google_sheet_to_db() -> Tuple[int, int]:
                 return default
             return str(row[idx]).strip()
 
-        # 讀取 SQLite 既有訂單的複合鍵集合 (標準化後比對)
+        # 讀取 SQLite 既有訂單的複合鍵 → id 集合 (標準化後比對)
         conn = get_db_connection()
-        existing_keys = set()
-        for r in conn.execute("SELECT check_in_date, name, phone FROM bookings").fetchall():
-            existing_keys.add((
-                _normalize_date_str(r[0]),
-                _normalize_text(r[1]),
-                _normalize_phone(r[2]),
-            ))
+        existing_key_ids = {}
+        for r in conn.execute("SELECT id, check_in_date, name, phone FROM bookings").fetchall():
+            _key = (
+                _normalize_date_str(r[1]),
+                _normalize_text(r[2]),
+                _normalize_phone(r[3]),
+            )
+            existing_key_ids.setdefault(_key, []).append(r[0])
 
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        inserted, skipped = 0, 0
-        new_records = []
+        skipped = 0
+        # 以複合鍵建立最新版本映射：批次內更晚出現的列自動覆寫先前列
+        latest_records = {}
         for raw in rows[1:]:
             row = list(raw) + [""] * max(0, len(header) - len(raw))
 
@@ -1122,17 +1125,13 @@ def pull_google_sheet_to_db() -> Tuple[int, int]:
 
             # 空白列或關鍵欄位缺失則跳過
             if not check_in_str or not name_val or not phone_val or not check_out_str:
-                continue
-
-            # 複合唯一約束去重：(入住日期, 姓名, 電話) 已存在即跳過
-            composite_key = (check_in_str, name_val, phone_val)
-            if composite_key in existing_keys:
                 skipped += 1
                 continue
 
+            composite_key = (check_in_str, name_val, phone_val)
             booking_code = _cell(row, "booking_code") or generate_booking_code(date.today())
             night_rush_raw = _cell(row, "night_rush").lower()
-            new_records.append((
+            latest_records[composite_key] = (
                 booking_code,
                 check_in_str,
                 check_out_str,
@@ -1150,13 +1149,21 @@ def pull_google_sheet_to_db() -> Tuple[int, int]:
                 _cell(row, "created_by") or "系統匯入",
                 _cell(row, "created_at") or now_str,
                 _cell(row, "updated_at") or now_str,
-            ))
-            # 同步加入集合，避免同一批次內重複插入
-            existing_keys.add(composite_key)
-            inserted += 1
+            )
 
-        # 批次插入新訂單並清除資料快取
-        if new_records:
+        # 最新覆寫：依複合鍵收集既有舊記錄 id 並刪除
+        # (雲端列代表最新更新，取代 SQLite 既有版本)
+        delete_ids = []
+        for key in latest_records:
+            delete_ids.extend(existing_key_ids.get(key, []))
+        if delete_ids:
+            conn.executemany(
+                "DELETE FROM bookings WHERE id = ?",
+                [(i,) for i in delete_ids],
+            )
+
+        # 批次插入最新版本並清除資料快取
+        if latest_records:
             conn.executemany(
                 """
                 INSERT INTO bookings (
@@ -1165,19 +1172,26 @@ def pull_google_sheet_to_db() -> Tuple[int, int]:
                     visit_count, tag, notes, total_amount, created_by, created_at, updated_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                new_records,
+                list(latest_records.values()),
             )
             conn.commit()
             st.cache_data.clear()
         conn.close()
 
+        inserted = len(latest_records)
+        overwritten = len(delete_ids)
+
         # 更新 session_state 啟動拉取狀態
         st.session_state["gsheet_startup_pull_done"] = True
         st.session_state["gsheet_last_pull_at"] = now_str
         st.session_state["gsheet_last_pull_new"] = inserted
+        st.session_state["gsheet_last_pull_overwritten"] = overwritten
         st.session_state["gsheet_last_pull_skipped"] = skipped
 
-        print(f"[Google Sheets Pull] 啟動拉取完成：新增 {inserted} 筆，跳過重複 {skipped} 筆")
+        print(
+            f"[Google Sheets Pull] 啟動拉取完成：寫入 {inserted} 筆"
+            f" (覆寫既有 {overwritten} 筆)，跳過無效 {skipped} 筆"
+        )
         return inserted, skipped
     except Exception as e:
         # 試算表不可達/憑證異常等：背景記錄並於畫面顯示警告，但不中斷 UI
@@ -2537,6 +2551,7 @@ def render_import_export_view():
                 if st.button("🚀 開始執行批次匯入", type="primary"):
                     success_count = 0
                     skip_count = 0
+                    overwrite_count = 0
                     error_logs = []
                     current_user = st.session_state.get("authenticated_user", "管理員")
                     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2547,17 +2562,18 @@ def render_import_export_view():
                     conn = get_db_connection()
                     cursor = conn.cursor()
 
-                    # 嚴格去重前置檢查：載入 SQLite 既有訂單的複合鍵
-                    # (入住日期, 姓名, 電話) 集合 (標準化後比對)
-                    existing_keys = set()
+                    # 最新覆寫前置檢查：載入 SQLite 既有訂單的複合鍵
+                    # (入住日期, 姓名, 電話) 對應 id 集合 (標準化後比對)
+                    existing_key_ids = {}
                     for _r in cursor.execute(
-                        "SELECT check_in_date, name, phone FROM bookings"
+                        "SELECT id, check_in_date, name, phone FROM bookings"
                     ).fetchall():
-                        existing_keys.add((
-                            _normalize_date_str(_r[0]),
-                            _normalize_text(_r[1]),
-                            _normalize_phone(_r[2]),
-                        ))
+                        _key = (
+                            _normalize_date_str(_r[1]),
+                            _normalize_text(_r[2]),
+                            _normalize_phone(_r[3]),
+                        )
+                        existing_key_ids.setdefault(_key, []).append(_r[0])
 
                     for idx, row in df_upload.iterrows():
                         try:
@@ -2646,20 +2662,22 @@ def render_import_export_view():
                                 error_logs.append(f"第 {idx+1} 列：缺少姓名或電話，略過。")
                                 continue
 
-                            # 嚴格去重檢查：(入住日期, 姓名, 電話) 複合鍵
-                            # 已存在即跳過 (含批次內重複)
+                            # 最新覆寫機制：本行代表最新更新 (區域/備註/
+                            # 客戶資料等)，複合鍵相同時先刪除既有舊記錄
+                            # (依 id 刪除，容忍電話/姓名格式差異) 再插入
                             import_key = (
                                 _normalize_date_str(check_in_str),
                                 _normalize_text(name),
                                 _normalize_phone(phone),
                             )
-                            if import_key in existing_keys:
-                                skip_count += 1
-                                error_logs.append(
-                                    f"第 {idx+1} 列：{name} 於 {check_in_str} "
-                                    f"已有相同電話的訂單，跳過重複匯入。"
-                                )
-                                continue
+                            if import_key in existing_key_ids:
+                                for _old_id in existing_key_ids[import_key]:
+                                    cursor.execute(
+                                        "DELETE FROM bookings WHERE id = ?",
+                                        (_old_id,),
+                                    )
+                                overwrite_count += 1
+                            existing_key_ids[import_key] = []
 
                             # 自動計算費用與訂單編號 (夜衝帳數獨立計費)
                             if is_valid_date:
@@ -2697,8 +2715,8 @@ def render_import_export_view():
                                 ),
                             )
                             success_count += 1
-                            # 同步加入複合鍵集合，避免同一批次內重複插入
-                            existing_keys.add(import_key)
+                            # 記錄新插入 id，供後續批次內覆寫比對
+                            existing_key_ids[import_key].append(cursor.lastrowid)
                         except Exception as e_row:
                             skip_count += 1
                             error_logs.append(f"第 {idx+1} 列匯入失敗: {e_row}")
@@ -2707,16 +2725,23 @@ def render_import_export_view():
                     conn.close()
 
                     st.cache_data.clear()
+                    # 立即重整 session_state 資料集，顯示最新匯入/覆寫結果
+                    refresh_session_state_data()
                     # SQLite 寫入成功後，即時同步至 Google Sheets
                     sync_db_to_google_sheet()
                     add_audit_log(
                         current_user,
                         "批次匯入訂單",
-                        f"自檔案 {uploaded_file.name} 匯入，成功 {success_count} 筆，略過/失敗 {skip_count} 筆",
+                        f"自檔案 {uploaded_file.name} 匯入，成功 {success_count} 筆"
+                        + (f"，覆寫既有 {overwrite_count} 筆" if overwrite_count else "")
+                        + f"，略過/失敗 {skip_count} 筆",
                     )
                     trigger_auto_sync(current_user)
 
-                    st.success(f"匯入作業完成！成功匯入 {success_count} 筆訂單。")
+                    success_msg = f"匯入作業完成！成功匯入 {success_count} 筆訂單"
+                    if overwrite_count:
+                        success_msg += f"（其中 {overwrite_count} 筆為覆寫既有訂單的最新版本）"
+                    st.success(success_msg)
                     if error_logs:
                         with st.expander("檢視異常/略過清單"):
                             for err in error_logs:
@@ -2955,7 +2980,7 @@ def main():
     init_db()
 
     # 啟動自動去重清理：依 (入住日期, 姓名, 電話) 複合鍵刪除重複訂單，
-    # 僅保留 id 最小 (最早建立) 的記錄；清理發生時清除資料快取，
+    # 僅保留 id 最大 (最近建立/最新版本) 的記錄；清理發生時清除資料快取，
     # 確保後續查詢與 session_state 立即反映無重複的結果
     if deduplicate_bookings() > 0:
         st.cache_data.clear()
