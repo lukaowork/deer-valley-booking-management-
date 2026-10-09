@@ -1435,6 +1435,76 @@ def render_login_view():
 
 
 # ==============================================================================
+# 6-1. 刪除確認對話框與刪除後端 (主鍵 id 綁定)
+# ==============================================================================
+def execute_delete_booking(
+    booking_id: int,
+    booking_info: Optional[Dict[str, Any]] = None,
+) -> None:
+    """依主鍵 id 刪除訂單並立即重整 UI 與雲端同步
+
+    刪除後端共用邏後端共用邏輯：參數化 DELETE ... WHERE id = ? →
+    清除資料快取 → 重查並重整 session_state 資料集 →
+    即時同步 Google Sheets → 寫入稽核日誌 → 觸發自動備份。
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
+    conn.commit()
+    conn.close()
+
+    st.cache_data.clear()
+    # 立即重查並重整 session_state 資料集
+    refresh_session_state_data()
+    # SQLite 刪除成功後，即時同步至 Google Sheets
+    sync_db_to_google_sheet()
+
+    current_user = st.session_state.get("authenticated_user", "管理員")
+    info = booking_info or {}
+    add_audit_log(
+        current_user,
+        "刪除訂單",
+        f"刪除訂單 {info.get('booking_code', '')} (露營人: {info.get('name', '')}, 電話: {info.get('phone', '')}, 區域: {info.get('area', '')}, 金額: {info.get('total_amount', '')})",
+    )
+    trigger_auto_sync(current_user)
+
+
+@st.dialog("🗑️ 確認刪除訂單")
+def render_delete_confirm_dialog(
+    booking_id: int,
+    booking_code: str,
+    guest_name: str,
+) -> None:
+    """刪除訂單確認對話框
+
+    由 session_state['show_delete_dialog'] 驅動，對話框渲染於
+    按鈕迴圈之外，使用者的確認意圖於 Streamlit 重跑間持續保留，
+    直到確認刪除或取消為止。
+    """
+    st.write(f"確定要刪除訂單 **{booking_code}** (露營人: {guest_name}) 嗎？")
+    st.warning("⚠️ 刪除後無法復原，並將同步更新 Google Sheets。")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("✅ 確認刪除", type="primary", use_container_width=True):
+            # 1. 執行 DELETE ... WHERE id = ?
+            execute_delete_booking(booking_id)
+            # 2. session_state 資料集已於 execute_delete_booking 內重查重整
+            # 3. 清除對話框旗標
+            st.session_state.pop("show_delete_dialog", None)
+            st.session_state.pop("delete_dialog_data", None)
+            # 4. 立即重跑，UI 即時反映刪除結果
+            st.success(f"訂單 {booking_code} 已順利刪除！")
+            st.rerun()
+    with col2:
+        if st.button("取消", use_container_width=True):
+            # 僅清除對話框旗標，不刪除任何資料
+            st.session_state.pop("show_delete_dialog", None)
+            st.session_state.pop("delete_dialog_data", None)
+            st.rerun()
+
+
+# ==============================================================================
 # 7. 頁面功能：營位總覽看板 (日曆式看板與點擊拉出資料卡抽屜)
 # ==============================================================================
 def render_dashboard_view():
@@ -1700,28 +1770,16 @@ def render_dashboard_view():
                     reset_booking_form_date_keys()
                     st.rerun()
             with btn_c2:
-                with st.popover("🗑️ 刪除", use_container_width=True):
-                    st.write(f"確定要刪除訂單 **{row['booking_code']}** ({row['name']}) 嗎？")
-                    if st.button("確認刪除", key=f"dash_del_confirm_{row['id']}", type="primary"):
-                        current_user = st.session_state.get("authenticated_user", "管理員")
-                        del_conn = get_db_connection()
-                        del_cursor = del_conn.cursor()
-                        del_cursor.execute("DELETE FROM bookings WHERE id = ?", (row["id"],))
-                        del_conn.commit()
-                        del_conn.close()
-                        st.cache_data.clear()
-                        # 立即重查並重整 session_state 資料集，UI 即時反映刪除結果
-                        refresh_session_state_data()
-                        # SQLite 寫入成功後，即時同步至 Google Sheets
-                        sync_db_to_google_sheet()
-                        add_audit_log(
-                            current_user,
-                            "刪除訂單",
-                            f"刪除訂單 {row['booking_code']} (露營人: {row['name']}, 電話: {row['phone']}, 區域: {row['area']}, 金額: {row['total_amount']})",
-                        )
-                        trigger_auto_sync(current_user)
-                        st.success(f"訂單 {row['booking_code']} 已順利刪除！")
-                        st.rerun()
+                # 刪除按鈕：僅設定對話框旗標 (session_state)，
+                # 確認對話框由 main() 統一渲染於按鈕迴圈之外
+                if st.button(
+                    "🗑️ 刪除",
+                    key=f"dash_del_btn_{row['id']}",
+                    use_container_width=True,
+                ):
+                    st.session_state["show_delete_dialog"] = row["id"]
+                    st.session_state["delete_dialog_data"] = dict(row)
+                    st.rerun()
 
 
 # ==============================================================================
@@ -1923,29 +1981,16 @@ def render_bookings_view():
                             reset_booking_form_date_keys()
                             st.rerun()
                     with btn_c2:
-                        with st.popover("🗑️ 刪除"):
-                            st.write(f"確定要刪除訂單 **{row['booking_code']}** ({row['name']}) 嗎？")
-                            if st.button("確認刪除", key=f"del_confirm_{row['id']}", type="primary"):
-                                current_user = st.session_state.get("authenticated_user", "管理員")
-                                del_conn = get_db_connection()
-                                del_cursor = del_conn.cursor()
-                                del_cursor.execute("DELETE FROM bookings WHERE id = ?", (row["id"],))
-                                del_conn.commit()
-                                del_conn.close()
-
-                                st.cache_data.clear()
-                                # 立即重查並重整 session_state 資料集，UI 即時反映刪除結果
-                                refresh_session_state_data()
-                                # SQLite 寫入成功後，即時同步至 Google Sheets
-                                sync_db_to_google_sheet()
-                                add_audit_log(
-                                    current_user,
-                                    "刪除訂單",
-                                    f"刪除訂單 {row['booking_code']} (露營人: {row['name']}, 電話: {row['phone']}, 區域: {row['area']}, 金額: {row['total_amount']})",
-                                )
-                                trigger_auto_sync(current_user)
-                                st.success(f"訂單 {row['booking_code']} 已順利刪除！")
-                                st.rerun()
+                        # 刪除按鈕：僅設定對話框旗標 (session_state)，
+                        # 確認對話框由 main() 統一渲染於按鈕迴圈之外
+                        if st.button(
+                            "🗑️ 刪除",
+                            key=f"del_btn_{row['id']}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["show_delete_dialog"] = row["id"]
+                            st.session_state["delete_dialog_data"] = dict(row)
+                            st.rerun()
         else:
             st.info("尚無符合搜尋條件的訂單記錄。")
 
@@ -3122,6 +3167,17 @@ def main():
         render_bookings_view()
     elif page_selection == "⚙️ 系統管理":
         render_system_management_view()
+
+    # 全域刪除確認對話框：由任一頁面的刪除按鈕觸發
+    # (session_state['show_delete_dialog'])，對話框渲染於
+    # 按鈕迴圈之外，確認意圖跨重跑持續保留
+    if "show_delete_dialog" in st.session_state:
+        _dialog_data = st.session_state.get("delete_dialog_data") or {}
+        render_delete_confirm_dialog(
+            int(st.session_state["show_delete_dialog"]),
+            str(_dialog_data.get("booking_code", "")),
+            str(_dialog_data.get("name", "")),
+        )
 
 
 if __name__ == "__main__":
