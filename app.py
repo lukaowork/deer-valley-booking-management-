@@ -2026,16 +2026,6 @@ FORM_CHECK_OUT_KEY = "booking_form_check_out_date"
 FORM_PREV_CHECK_IN_KEY = "booking_form_prev_check_in"
 
 
-def on_check_in_change():
-    """入住日期變更 callback：自動計算並連動退房日期為入住後 1 天"""
-    if FORM_CHECK_IN_KEY in st.session_state:
-        check_in = st.session_state[FORM_CHECK_IN_KEY]
-        # 更新預設退房日為入住隔天
-        new_check_out = check_in + timedelta(days=1)
-        st.session_state[FORM_CHECK_OUT_KEY] = new_check_out
-        st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in
-
-
 def reset_booking_form_date_keys():
     """重置表單日期鍵值，讓表單下次渲染時正確帶入預設的入住/退房日期"""
     for _dk in (FORM_CHECK_IN_KEY, FORM_CHECK_OUT_KEY, FORM_PREV_CHECK_IN_KEY):
@@ -2294,25 +2284,21 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 "主要入住日期 *",
                 value=default_check_in,
                 key=FORM_CHECK_IN_KEY,
-                on_change=on_check_in_change,
             )
 
-        # 退房日期自動連動：使用純函式計算，防止 StreamlitValueBelowMinError
-        # 若使用者更改入住日期，動態計算 min_checkout = check_in + 1 天
+        # 退房日期自動連動：純函式計算，防止 StreamlitValueBelowMinError
+        # 動態計算 min_checkout = check_in + 1 天
         # 若目前退房日期 <= 入住日期，自動強制設為 min_checkout
-        min_checkout, current_check_out = compute_linked_checkout(
-            check_in_val=check_in_val,
-            default_check_out=default_check_out,
-            prev_check_in=st.session_state.get(FORM_PREV_CHECK_IN_KEY, None),
-            current_check_out=st.session_state.get(FORM_CHECK_OUT_KEY, None),
-        )
-        st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in_val
-        st.session_state[FORM_CHECK_OUT_KEY] = current_check_out
+        min_checkout = check_in_val + timedelta(days=1)
+        current_checkout = st.session_state.get(FORM_CHECK_OUT_KEY, default_check_out)
+        if current_checkout <= check_in_val:
+            current_checkout = min_checkout
+        st.session_state[FORM_CHECK_OUT_KEY] = current_checkout
 
         with col_d2:
             check_out_val = st.date_input(
                 "預計退房日期 *",
-                value=current_check_out,
+                value=current_checkout,
                 min_value=min_checkout,
                 key=FORM_CHECK_OUT_KEY,
             )
