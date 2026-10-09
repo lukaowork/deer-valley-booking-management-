@@ -1558,63 +1558,6 @@ def render_card_edit_delete_controls(row: pd.Series) -> None:
         )
 
 
-
-# ==============================================================================
-# 6-2. 編輯與刪除卡片回調 (Session State 驅動)
-# ==============================================================================
-def trigger_edit_booking(record_id: int, row_data: Dict[str, Any]):
-    """編輯卡片回調：載入資料並跳轉至編輯表單"""
-    st.session_state["editing_booking_id"] = record_id
-    st.session_state["editing_booking_data"] = row_data
-    st.session_state["jump_to_page"] = "➕ 新增露營預約"
-    reset_booking_form_date_keys()
-
-
-def trigger_delete_dialog(record_id: int, row_data: Dict[str, Any]):
-    """刪除卡片回調：觸發刪除對話框"""
-    st.session_state["deleting_booking_id"] = record_id
-    st.session_state["deleting_booking_data"] = row_data
-
-
-# ==============================================================================
-# 6-3. 刪除確認對話框 (原生 Modal)
-# ==============================================================================
-@st.dialog("⚠️ 確認刪除預約")
-def render_delete_confirm_modal():
-    """刪除確認視窗：執行 DELETE 並重整資料"""
-    booking_id = st.session_state["deleting_booking_id"]
-    row = st.session_state["deleting_booking_data"]
-    
-    st.write(f"確定要刪除這筆預約嗎？")
-    st.info(f"姓名: {row['name']}\n入住日期: {row['check_in_date']}")
-    
-    col1, col2 = st.columns(2)
-    if col1.button("確定刪除", type="primary", use_container_width=True):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM bookings WHERE id = ?", (booking_id,))
-        conn.commit()
-        conn.close()
-        
-        st.cache_data.clear()
-        refresh_session_state_data()
-        sync_db_to_google_sheet()
-        
-        # 稽核日誌
-        current_user = st.session_state.get("authenticated_user", "管理員")
-        add_audit_log(current_user, "刪除訂單", f"刪除訂單 {row.get('booking_code')} (ID {booking_id})")
-        trigger_auto_sync(current_user)
-        
-        st.session_state["deleting_booking_id"] = None
-        st.session_state["deleting_booking_data"] = None
-        st.rerun()
-        
-    if col2.button("取消", use_container_width=True):
-        st.session_state["deleting_booking_id"] = None
-        st.session_state["deleting_booking_data"] = None
-        st.rerun()
-
-
 # ==============================================================================
 # 7. 頁面功能：營位總覽看板 (日曆式看板與點擊拉出資料卡抽屜)
 # ==============================================================================
@@ -2397,28 +2340,6 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 current_user = st.session_state.get("authenticated_user", "管理員")
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 has_night_rush = 1 if has_night_rush else 0
-                
-                # 執行寫入 (SQL)
-                conn = get_db_connection()
-                if is_editing:
-                    # 使用絕對路徑
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "UPDATE bookings SET name=?, phone=?, check_in_date=?, check_out_date=?, area=?, notes=? WHERE id=?",
-                        (name_val, phone_val, check_in_val.strftime("%Y-%m-%d"), check_out_val.strftime("%Y-%m-%d"), area_val, notes_val, editing_id)
-                    )
-                    conn.commit()
-                    st.success("✅ 預約內容已成功更新！")
-                    time.sleep(3)
-                    st.session_state["editing_booking_id"] = None
-                else:
-                    # (略過新增的寫入邏輯)
-                    pass
-                conn.close()
-                
-                # 同步 Google Sheets
-                sync_db_to_google_sheet()
-                st.rerun()
 
                 conn = get_db_connection()
                 cursor = conn.cursor()
@@ -2464,7 +2385,8 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         st.session_state["editing_booking_id"] = None
                         st.session_state["editing_booking_data"] = None
                         reset_booking_form_date_keys()
-                        st.success(f"訂單 {booking_data['booking_code']} 修改成功！")
+                        st.toast("✅ 預約內容已成功更新！")
+                        time.sleep(3)
                         
                         if is_quick_mode:
                             st.session_state["show_quick_booking_form"] = False
