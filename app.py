@@ -2405,7 +2405,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                     cursor = conn.cursor()
                     cursor.execute(
                         "UPDATE bookings SET name=?, phone=?, check_in_date=?, check_out_date=?, area=?, notes=? WHERE id=?",
-                        (name_val, phone_val, check_in_val.strftime("%Y-%m-%d"), check_out_val.strftime("%Y-%m-%d"), area_str, notes_val, editing_id)
+                        (name_val, phone_val, check_in_val.strftime("%Y-%m-%d"), check_out_val.strftime("%Y-%m-%d"), area_val, notes_val, editing_id)
                     )
                     conn.commit()
                     st.success("✅ 預約內容已成功更新！")
@@ -2417,7 +2417,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 conn.close()
                 
                 # 同步 Google Sheets
-                push_to_sheets() 
+                sync_db_to_google_sheet()
                 st.rerun()
 
                 conn = get_db_connection()
