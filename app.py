@@ -543,6 +543,18 @@ def load_data() -> pd.DataFrame:
     return fetch_all_bookings_df()
 
 
+def refresh_session_state_data() -> pd.DataFrame:
+    """同步完成後重新查詢全量訂單並明確寫入 st.session_state
+
+    於 Google Sheets 拉取/同步流程完成後呼叫，確保表格、指標與
+    日曆等 UI 元件皆能取得非空的最新訂單資料。
+    """
+    df = load_data()
+    st.session_state["bookings_df"] = df
+    st.session_state["bookings_last_refreshed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return df
+
+
 def format_phone_number(raw_val) -> str:
     """清理並格式化電話號碼：去除小數點 .0，轉為純字串並補齊開頭 0"""
     if pd.isna(raw_val) or raw_val is None:
@@ -1127,8 +1139,9 @@ def pull_google_sheet_to_db() -> Tuple[int, int]:
         print(f"[Google Sheets Pull] 啟動拉取完成：新增 {inserted} 筆，跳過重複 {skipped} 筆")
         return inserted, skipped
     except Exception as e:
-        # 試算表不可達/憑證異常等皆不中斷 UI，僅背景記錄
+        # 試算表不可達/憑證異常等：背景記錄並於畫面顯示警告，但不中斷 UI
         print(f"[Google Sheets Pull] 啟動拉取失敗 (UI 不受影響)：{e}")
+        st.warning(f"⚠️ Google Sheets 啟動拉取失敗，將以本機 SQLite 資料顯示：{e}")
         st.session_state["gsheet_startup_pull_done"] = True
         return 0, 0
 
@@ -2834,16 +2847,19 @@ def render_system_management_view():
 # ==============================================================================
 def main():
     apply_custom_styles()
-    # 每次應用程式重跑/啟動皆執行：建表 (CREATE TABLE IF NOT EXISTS) 並透過
-    # load_data() 載入全量訂單，確保 Streamlit 睡眠喚醒後資料與 UI 狀態正確
+    # 每次應用程式重跑/啟動皆執行：建表 (CREATE TABLE IF NOT EXISTS)
     init_db()
-    load_data()
-    init_admins()
 
-    # 啟動/登入時自動從 Google Sheets 拉取訂單並嚴格去重匯入
-    # (每個瀏覽器階段僅執行一次)；試算表不可達時不中斷 UI，僅背景記錄
-    if not st.session_state.get("gsheet_startup_pull_done"):
-        pull_google_sheet_to_db()
+    # 強制啟動拉取：每次載入應用程式皆自動從 Google Sheets 拉取訂單
+    # 並嚴格去重匯入 SQLite (不依賴手動觸發或被動的 session_state 檢查)；
+    # 試算表不可達時畫面顯示警告但不中斷 UI
+    pull_google_sheet_to_db()
+
+    # 同步完成後重新查詢全量訂單並寫入 session_state，
+    # 確保表格/指標/日曆等 UI 元件取得非空資料
+    refresh_session_state_data()
+
+    init_admins()
 
     # 檢查是否因 60 秒無動作觸發資安自動登出
     if st.query_params.get("auto_logout") == "1":
