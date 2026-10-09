@@ -13,6 +13,7 @@ import os
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -25,7 +26,11 @@ import streamlit.components.v1 as components
 APP_TITLE = "祿野營地訂位管理系統"
 APP_SUBTITLE = "專業・溫馨・便利的露營營位管理後台"
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# 應用程式根目錄：以 pathlib 絕對鎖定 (resolve 會一併解析符號連結)，
+# 確保 Streamlit 睡眠喚醒/重開機後即使工作目錄改變，SQLite 資料庫仍
+# 絕對指向 app.py 所在目錄，不會誤用相對路徑或建立空資料庫檔案
+APP_ROOT = Path(__file__).resolve().parent
+DATA_DIR = os.path.join(str(APP_ROOT), "data")
 DB_PATH = os.path.join(DATA_DIR, "luye_camping.db")
 ADMIN_CONFIG_PATH = os.path.join(DATA_DIR, "admins.json")
 SERVICE_ACCOUNT_PATH = os.path.join(DATA_DIR, "service_account.json")
@@ -526,6 +531,15 @@ def fetch_all_bookings_df() -> pd.DataFrame:
     df = pd.read_sql_query("SELECT * FROM bookings ORDER BY check_in_date DESC", conn)
     conn.close()
     return df
+
+
+def load_data() -> pd.DataFrame:
+    """載入全量訂單資料 (統一資料載入入口)
+
+    於每次應用程式重跑/啟動時由 main() 呼叫，確保 Streamlit 睡眠喚醒後
+    session_state 與各頁面 UI 元件皆能正確載入最新訂單資料。
+    """
+    return fetch_all_bookings_df()
 
 
 def format_phone_number(raw_val) -> str:
@@ -1690,6 +1704,50 @@ def reset_booking_form_date_keys():
         st.session_state.pop(_dk, None)
 
 
+def compute_linked_checkout(
+    check_in_val: date,
+    default_check_out: date,
+    prev_check_in: Optional[date],
+    current_check_out: Optional[date],
+) -> Tuple[date, date]:
+    """純函式：計算預約表單入住/退房日期自動連動
+
+    入住日期選取時自動計算 default_check_out = check_in + timedelta(days=1)，
+    退房日期選擇器的 value 與 min_value 皆動態對應該值，
+    確保最低住宿一晚，並防止選取同日或早於入住日的日期。
+
+    參數：
+    - check_in_val: 目前入住日期
+    - default_check_out: 表單預設退房日 (編輯模式為原訂單退房日；新增模式為入住日 +1 天)
+    - prev_check_in: 前次渲染的入住日期 (用於偵測變更)
+    - current_check_out: 目前 session_state 中的退房日期
+
+    回傳 (min_checkout, linked_check_out)：
+    - min_checkout: 退房日期最小合規值 (= check_in + 1 天)
+    - linked_check_out: 應寫入 session_state 的退房日期
+    """
+    # 退房日期最小合規值 (入住日 +1 天，兩天一夜預設)
+    min_checkout = check_in_val + timedelta(days=1)
+
+    # 入住日期變更同步機制：入住日期改變時，強制更新退房日期為新入住日 +1 天
+    # (註：Streamlit 規範禁止 st.form 內的 widget 使用 on_change 回調，
+    #  否則會拋出 StreamlitInvalidFormCallbackError，故以此同步機制實現相同效果)
+    if prev_check_in is not None and check_in_val != prev_check_in:
+        return min_checkout, min_checkout
+
+    # 退房日期 Session State 初始化：首次渲染時以表單預設值建立鍵值
+    # (編輯模式為原訂單退房日，新增/快速新增模式為入住日 +1 天)
+    if current_check_out is None:
+        current_check_out = default_check_out
+
+    # 防衛邏輯：若退房日期小於 min_checkout (或小於等於入住日期)，強制更新為 min_checkout
+    # 確保 st.date_input 的 value 絕對不小於 min_value，徹底杜絕 StreamlitValueBelowMinError
+    if current_check_out < min_checkout or current_check_out <= check_in_val:
+        current_check_out = min_checkout
+
+    return min_checkout, current_check_out
+
+
 def render_booking_form_view(is_quick_mode: bool = False):
     editing_id = st.session_state.get("editing_booking_id", None)
     is_editing = editing_id is not None
@@ -1857,32 +1915,18 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 key=FORM_CHECK_IN_KEY,
             )
 
-        # 退房日期最小合規值 (入住日 +1 天，兩天一夜預設)
-        min_checkout = check_in_val + timedelta(days=1)
-
-        # 入住日期變更同步機制：入住日期改變時，強制更新退房日期為新入住日 +1 天
-        # (註：Streamlit 規範禁止 st.form 內的 widget 使用 on_change 回調，
-        #  否則會拋出 StreamlitInvalidFormCallbackError，故以此同步機制實現相同效果)
-        prev_check_in = st.session_state.get(FORM_PREV_CHECK_IN_KEY, None)
-        if prev_check_in is not None and check_in_val != prev_check_in:
-            st.session_state[FORM_CHECK_OUT_KEY] = min_checkout
+        # 退房日期自動連動 (純函式計算，詳見 compute_linked_checkout)：
+        # 入住日期選取時自動計算 default_check_out = check_in + 1 天，
+        # 並將退房日期選擇器的 value 與 min_value 動態設為該值，
+        # 確保最低住宿一晚，杜絕選取同日或早於入住日的日期
+        min_checkout, linked_check_out = compute_linked_checkout(
+            check_in_val=check_in_val,
+            default_check_out=default_check_out,
+            prev_check_in=st.session_state.get(FORM_PREV_CHECK_IN_KEY, None),
+            current_check_out=st.session_state.get(FORM_CHECK_OUT_KEY, None),
+        )
         st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in_val
-
-        # 退房日期 Session State 初始化：首次渲染時以表單預設值建立鍵值
-        # (編輯模式為原訂單退房日，新增/快速新增模式為入住日 +1 天)
-        if FORM_CHECK_OUT_KEY not in st.session_state:
-            st.session_state[FORM_CHECK_OUT_KEY] = default_check_out
-
-        # 防衛邏輯：主動檢查並修復 FORM_CHECK_OUT_KEY 的 Session State
-        # 若其值小於 min_checkout (或小於等於入住日期)，強制更新為 min_checkout
-        # 確保 st.date_input 的 value 絕對不小於 min_value，徹底杜絕 StreamlitValueBelowMinError
-        current_check_out = st.session_state[FORM_CHECK_OUT_KEY]
-        if (
-            current_check_out is None
-            or current_check_out < min_checkout
-            or current_check_out <= check_in_val
-        ):
-            st.session_state[FORM_CHECK_OUT_KEY] = min_checkout
+        st.session_state[FORM_CHECK_OUT_KEY] = linked_check_out
 
         with col_d2:
             check_out_val = st.date_input(
@@ -2601,7 +2645,10 @@ def render_system_management_view():
 # ==============================================================================
 def main():
     apply_custom_styles()
+    # 每次應用程式重跑/啟動皆執行：建表 (CREATE TABLE IF NOT EXISTS) 並透過
+    # load_data() 載入全量訂單，確保 Streamlit 睡眠喚醒後資料與 UI 狀態正確
     init_db()
+    load_data()
     init_admins()
 
     # 檢查是否因 60 秒無動作觸發資安自動登出
