@@ -555,6 +555,47 @@ def refresh_session_state_data() -> pd.DataFrame:
     return df
 
 
+def deduplicate_bookings() -> int:
+    """啟動時自動清理 bookings 表中的重複訂單
+
+    依複合鍵 (入住日期 check_in_date, 露營人姓名 name,
+    露營人電話 phone) 分組，每組僅保留 id 最小
+    (最早建立) 的記錄，刪除其餘重複項。
+
+    回傳刪除的重複筆數 (0 表示無重複)；失敗時回傳 -1，
+    不影響啟動流程。
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            DELETE FROM bookings
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM bookings
+                GROUP BY check_in_date, name, phone
+            )
+            """
+        )
+        deleted = max(0, cursor.rowcount)
+        conn.commit()
+        conn.close()
+
+        if deleted > 0:
+            print(f"[Dedup] 啟動自動去重：刪除重複訂單 {deleted} 筆")
+            add_audit_log(
+                "系統",
+                "自動去重清理",
+                f"啟動時依 (入住日期, 姓名, 電話) 複合鍵自動清理重複訂單 {deleted} 筆",
+            )
+        return deleted
+    except Exception as e:
+        # 清理失敗不影響啟動流程，僅背景記錄
+        print(f"[Dedup] 啟動自動去重失敗 (不影響啟動): {e}")
+        return -1
+
+
 def format_phone_number(raw_val) -> str:
     """清理並格式化電話號碼：去除小數點 .0，轉為純字串並補齊開頭 0"""
     if pd.isna(raw_val) or raw_val is None:
@@ -2506,6 +2547,18 @@ def render_import_export_view():
                     conn = get_db_connection()
                     cursor = conn.cursor()
 
+                    # 嚴格去重前置檢查：載入 SQLite 既有訂單的複合鍵
+                    # (入住日期, 姓名, 電話) 集合 (標準化後比對)
+                    existing_keys = set()
+                    for _r in cursor.execute(
+                        "SELECT check_in_date, name, phone FROM bookings"
+                    ).fetchall():
+                        existing_keys.add((
+                            _normalize_date_str(_r[0]),
+                            _normalize_text(_r[1]),
+                            _normalize_phone(_r[2]),
+                        ))
+
                     for idx, row in df_upload.iterrows():
                         try:
                             # 姓名與電話解析
@@ -2593,6 +2646,21 @@ def render_import_export_view():
                                 error_logs.append(f"第 {idx+1} 列：缺少姓名或電話，略過。")
                                 continue
 
+                            # 嚴格去重檢查：(入住日期, 姓名, 電話) 複合鍵
+                            # 已存在即跳過 (含批次內重複)
+                            import_key = (
+                                _normalize_date_str(check_in_str),
+                                _normalize_text(name),
+                                _normalize_phone(phone),
+                            )
+                            if import_key in existing_keys:
+                                skip_count += 1
+                                error_logs.append(
+                                    f"第 {idx+1} 列：{name} 於 {check_in_str} "
+                                    f"已有相同電話的訂單，跳過重複匯入。"
+                                )
+                                continue
+
                             # 自動計算費用與訂單編號 (夜衝帳數獨立計費)
                             if is_valid_date:
                                 calc_total, _, _, _ = calculate_booking_fee(area, qty, check_in_dt, check_out_dt, rush_qty)
@@ -2629,6 +2697,8 @@ def render_import_export_view():
                                 ),
                             )
                             success_count += 1
+                            # 同步加入複合鍵集合，避免同一批次內重複插入
+                            existing_keys.add(import_key)
                         except Exception as e_row:
                             skip_count += 1
                             error_logs.append(f"第 {idx+1} 列匯入失敗: {e_row}")
@@ -2883,6 +2953,12 @@ def main():
     apply_custom_styles()
     # 每次應用程式重跑/啟動皆執行：建表 (CREATE TABLE IF NOT EXISTS)
     init_db()
+
+    # 啟動自動去重清理：依 (入住日期, 姓名, 電話) 複合鍵刪除重複訂單，
+    # 僅保留 id 最小 (最早建立) 的記錄；清理發生時清除資料快取，
+    # 確保後續查詢與 session_state 立即反映無重複的結果
+    if deduplicate_bookings() > 0:
+        st.cache_data.clear()
 
     # 強制啟動拉取：每次載入應用程式皆自動從 Google Sheets 拉取訂單
     # 並嚴格去重匯入 SQLite (不依賴手動觸發或被動的 session_state 檢查)；
