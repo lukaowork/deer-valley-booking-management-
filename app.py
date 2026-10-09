@@ -2294,25 +2294,25 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 "主要入住日期 *",
                 value=default_check_in,
                 key=FORM_CHECK_IN_KEY,
+                on_change=on_check_in_change,
             )
 
-        # 退房日期自動連動 (純函式計算，詳見 compute_linked_checkout)：
-        # 入住日期選取時自動計算 default_check_out = check_in + 1 天，
-        # 並將退房日期選擇器的 value 與 min_value 動態設為該值，
-        # 確保最低住宿一晚，杜絕選取同日或早於入住日的日期
-        min_checkout, linked_check_out = compute_linked_checkout(
+        # 退房日期自動連動：使用純函式計算，防止 StreamlitValueBelowMinError
+        # 若使用者更改入住日期，動態計算 min_checkout = check_in + 1 天
+        # 若目前退房日期 <= 入住日期，自動強制設為 min_checkout
+        min_checkout, current_check_out = compute_linked_checkout(
             check_in_val=check_in_val,
             default_check_out=default_check_out,
             prev_check_in=st.session_state.get(FORM_PREV_CHECK_IN_KEY, None),
             current_check_out=st.session_state.get(FORM_CHECK_OUT_KEY, None),
         )
         st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in_val
-        st.session_state[FORM_CHECK_OUT_KEY] = linked_check_out
+        st.session_state[FORM_CHECK_OUT_KEY] = current_check_out
 
         with col_d2:
             check_out_val = st.date_input(
                 "預計退房日期 *",
-                value=st.session_state.get(FORM_CHECK_OUT_KEY, min_checkout),
+                value=current_check_out,
                 min_value=min_checkout,
                 key=FORM_CHECK_OUT_KEY,
             )
