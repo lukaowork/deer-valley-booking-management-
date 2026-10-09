@@ -1435,7 +1435,7 @@ def render_login_view():
 
 
 # ==============================================================================
-# 6-1. 刪除後端 (主鍵 id 綁定，由「✏️ 預約管理」頁面呼叫)
+# 6-1. 刪除後端與卡片內嵌編輯/刪除控件 (主鍵 id 綁定)
 # ==============================================================================
 def execute_delete_booking(
     booking_id: int,
@@ -1469,13 +1469,148 @@ def execute_delete_booking(
     trigger_auto_sync(current_user)
 
 
+def _parse_date_value(raw_value: Any, fallback: date) -> date:
+    """安全解析訂單日期字串為 date 物件
+
+    歷史資料可能含占位日期 (如「歷史客戶/無預約日期」)，
+    解析失敗時回退至 fallback，避免 date_input 拋錯。
+    """
+    try:
+        return datetime.strptime(str(raw_value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return fallback
+
+
+def render_card_edit_delete_controls(row: pd.Series) -> None:
+    """訂單卡片內嵌的編輯/刪除控件 (session_state 驅動)
+
+    按鈕鍵以訂單主鍵 id 嚴格唯一綁定 (card_edit_/card_del_)；
+    點擊編輯/刪除僅設定 active_edit_id / active_delete_id，
+    編輯表單與刪除確認直接渲染於該卡片下方，使用者
+    意圖跨 Streamlit 重跑持續保留，直到儲存/取消/刪除。
+    """
+    record_id = int(row["id"])
+    booking_code = str(row.get("booking_code") or "")
+
+    # 操作按鈕 (鍵名以主鍵 id 唯一綁定)
+    btn_c1, btn_c2 = st.columns([1, 1])
+    with btn_c1:
+        if st.button("✏️ 編輯", key=f"card_edit_{record_id}", use_container_width=True):
+            st.session_state["active_edit_id"] = record_id
+            st.rerun()
+    with btn_c2:
+        if st.button("🗑️ 刪除", key=f"card_del_{record_id}", use_container_width=True):
+            st.session_state["active_delete_id"] = record_id
+            st.rerun()
+
+    # 編輯表單：僅當作用中編輯 id 為此卡片時，渲染於卡片下方
+    if st.session_state.get("active_edit_id") == record_id:
+        default_check_in = _parse_date_value(row.get("check_in_date"), date.today())
+        default_check_out = _parse_date_value(
+            row.get("check_out_date"), default_check_in + timedelta(days=1)
+        )
+        with st.form(f"card_edit_form_{record_id}"):
+            st.markdown("#### 📝 編輯預約資料")
+            edit_col1, edit_col2 = st.columns(2)
+            with edit_col1:
+                edit_name = st.text_input("露營人姓名 *", value=str(row.get("name") or ""))
+                edit_phone = st.text_input("聯絡電話 *", value=str(row.get("phone") or ""))
+            with edit_col2:
+                edit_check_in = st.date_input("入住日期", value=default_check_in)
+                edit_check_out = st.date_input("退房日期", value=default_check_out)
+            edit_area = st.text_input("預約區域", value=str(row.get("area") or ""))
+            edit_notes = st.text_area("備註說明", value=str(row.get("notes") or ""))
+            submitted = st.form_submit_button(
+                "💾 儲存變更", use_container_width=True, type="primary"
+            )
+
+        if submitted:
+            # 防呆：姓名/電話為 None 或空字串時拒絕寫入
+            if not str(edit_name or "").strip():
+                st.error("露營人姓名不可為空，請輸入後再儲存。")
+            elif not str(edit_phone or "").strip():
+                st.error("聯絡電話不可為空，請輸入後再儲存。")
+            elif edit_check_out < edit_check_in:
+                st.error("退房日期不可早於入住日期，請修正後再儲存。")
+            else:
+                conn = get_db_connection()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE bookings
+                    SET name = ?, phone = ?, check_in_date = ?, check_out_date = ?, area = ?, notes = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        str(edit_name).strip(),
+                        str(edit_phone).strip(),
+                        edit_check_in.isoformat(),
+                        edit_check_out.isoformat(),
+                        str(edit_area or "").strip(),
+                        str(edit_notes or ""),
+                        record_id,
+                    ),
+                )
+                conn.commit()
+                conn.close()
+
+                st.cache_data.clear()
+                # 重查並重整 session_state 資料集
+                refresh_session_state_data()
+                # SQLite 寫入成功後，即時同步至 Google Sheets
+                sync_db_to_google_sheet()
+                current_user = st.session_state.get("authenticated_user", "管理員")
+                add_audit_log(
+                    current_user,
+                    "編輯訂單",
+                    f"更新訂單 {booking_code} (ID {record_id}) 基本資料",
+                )
+                trigger_auto_sync(current_user)
+                # 重置作用中編輯 id，並立即重跑讓卡片反映變更
+                st.session_state["active_edit_id"] = None
+                st.success(f"已更新！訂單 {booking_code} 的變更已儲存。")
+                st.rerun()
+
+        # 取消編輯 (表單外按鈕：st.form 內的普通按鈕不會觸發)
+        if st.button(
+            "✖️ 取消編輯", key=f"card_edit_cancel_{record_id}", use_container_width=True
+        ):
+            st.session_state["active_edit_id"] = None
+            st.rerun()
+
+    # 刪除確認：僅當作用中刪除 id 為此卡片時，渲染於卡片下方
+    if st.session_state.get("active_delete_id") == record_id:
+        st.warning(
+            f"⚠️ 確定要刪除訂單 **{booking_code}**（{row.get('name')}，"
+            f"入住 {row.get('check_in_date')}）嗎？刪除後無法復原。"
+        )
+        conf_c1, conf_c2 = st.columns(2)
+        with conf_c1:
+            if st.button(
+                "確認刪除",
+                key=f"card_del_confirm_{record_id}",
+                type="primary",
+                use_container_width=True,
+            ):
+                # 刪除後端：DELETE ... WHERE id = ? → 重查並重整
+                # session_state 資料集 → 即時同步 → 稽核日誌 → 備份
+                execute_delete_booking(record_id, dict(row))
+                # 重置作用中刪除 id，並立即重跑讓卡片消失
+                st.session_state["active_delete_id"] = None
+                st.rerun()
+        with conf_c2:
+            if st.button(
+                "取消", key=f"card_del_cancel_{record_id}", use_container_width=True
+            ):
+                st.session_state["active_delete_id"] = None
+                st.rerun()
+
+
 # ==============================================================================
 # 7. 頁面功能：營位總覽看板 (日曆式看板與點擊拉出資料卡抽屜)
 # ==============================================================================
 def render_dashboard_view():
     st.markdown("### 📊 營區營位總覽看板 (日曆視角)")
-
-    st.caption("💡 如需編輯或刪除訂單，請使用上方選單的「✏️ 預約管理」頁面（選單式編輯 / 刪除）。")
 
     # 1. 統一管理狀態
     if "dash_view_mode" not in st.session_state:
@@ -1727,14 +1862,16 @@ def render_dashboard_view():
             else:
                 st.markdown(card_html, unsafe_allow_html=True)
 
+            # 卡片內嵌編輯/刪除控件 (session_state 驅動，
+            # 表單與確認直接渲染於卡片下方)
+            render_card_edit_delete_controls(row)
+
 
 # ==============================================================================
 # 8. 頁面功能：訂位清單與三大核心索引搜尋 (Search & Booking Management)
 # ==============================================================================
 def render_bookings_view():
     st.markdown("### 📋 露營客訂單管理與快速檢索")
-
-    st.caption("💡 如需編輯或刪除訂單，請使用上方選單的「✏️ 預約管理」頁面（選單式編輯 / 刪除）。")
 
     # ==========================
     # 三大核心搜尋索引工具列
@@ -1919,6 +2056,10 @@ def render_bookings_view():
                         st.html(card_html)
                     else:
                         st.markdown(card_html, unsafe_allow_html=True)
+
+                    # 卡片內嵌編輯/刪除控件 (session_state 驅動，
+                    # 表單與確認直接渲染於卡片下方)
+                    render_card_edit_delete_controls(row)
 
         else:
             st.info("尚無符合搜尋條件的訂單記錄。")
@@ -2345,146 +2486,6 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 except Exception as e:
                     conn.close()
                     st.error(f"儲存訂單時發生錯誤: {e}")
-
-
-# ==============================================================================
-# 9-1. 頁面功能：預約管理 (選單式編輯 / 刪除，selectbox 驅動)
-# ==============================================================================
-def _parse_manage_date(raw_value: Any, fallback: date) -> date:
-    """安全解析訂單日期字串為 date 物件
-
-    歷史資料可能含占位日期 (如「歷史客戶/無預約日期」)，
-    解析失敗時回退至 fallback，避免 date_input 拋錯。
-    """
-    try:
-        return datetime.strptime(str(raw_value)[:10], "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        return fallback
-
-
-def render_booking_manage_view():
-    """✏️ 預約管理：selectbox 選取訂單後進行編輯或刪除
-
-    取代原先散見於看板/清單卡片迴圈內的編輯/刪除按鈕：
-    編輯表單與刪除確認集中於此頁面渲染，不隨迴圈重渲染
-    而遺失狀態，Streamlit 重跑間穩定可觸發。
-    """
-    st.markdown("### ✏️ 預約管理 (選單式編輯 / 刪除)")
-
-    df = load_data()
-    if df.empty:
-        st.info("目前尚無任何預約訂單。")
-        return
-
-    booking_records = df.to_dict("records")
-    selected_booking = st.selectbox(
-        "選擇要處理的預約",
-        options=booking_records,
-        format_func=lambda x: f"ID {x['id']}: {x['name']} - {x['check_in_date']} ({x['area']})",
-        key="manage_booking_select",
-    )
-    if not selected_booking:
-        st.info("請選擇一筆預約訂單。")
-        return
-
-    booking_id = int(selected_booking["id"])
-    booking_code = str(selected_booking.get("booking_code") or "")
-
-    # ==========================
-    # 編輯表單 (st.form：僅於點擊「儲存修改」時整批觸發)
-    # ==========================
-    default_check_in = _parse_manage_date(selected_booking.get("check_in_date"), date.today())
-    default_check_out = _parse_manage_date(
-        selected_booking.get("check_out_date"), default_check_in + timedelta(days=1)
-    )
-
-    with st.form("manage_edit_form"):
-        st.markdown("#### 📝 編輯預約資料")
-        st.caption(f"訂單編號：{booking_code}")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            edit_name = st.text_input("露營人姓名 *", value=str(selected_booking.get("name") or ""))
-            edit_phone = st.text_input("聯絡電話 *", value=str(selected_booking.get("phone") or ""))
-        with col2:
-            edit_check_in = st.date_input("入住日期", value=default_check_in)
-            edit_check_out = st.date_input("退房日期", value=default_check_out)
-
-        edit_area = st.text_input("預約區域", value=str(selected_booking.get("area") or ""))
-        edit_notes = st.text_area("備註說明", value=str(selected_booking.get("notes") or ""))
-
-        submitted = st.form_submit_button("💾 儲存修改", use_container_width=True, type="primary")
-
-    if submitted:
-        # 防呆：姓名/電話為 None 或空字串時拒絕寫入
-        if not str(edit_name or "").strip():
-            st.error("露營人姓名不可為空，請輸入後再儲存。")
-        elif not str(edit_phone or "").strip():
-            st.error("聯絡電話不可為空，請輸入後再儲存。")
-        elif edit_check_out < edit_check_in:
-            st.error("退房日期不可早於入住日期，請修正後再儲存。")
-        else:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE bookings
-                SET name = ?, phone = ?, check_in_date = ?, check_out_date = ?, area = ?, notes = ?
-                WHERE id = ?
-                """,
-                (
-                    str(edit_name).strip(),
-                    str(edit_phone).strip(),
-                    edit_check_in.isoformat(),
-                    edit_check_out.isoformat(),
-                    str(edit_area or "").strip(),
-                    str(edit_notes or ""),
-                    booking_id,
-                ),
-            )
-            conn.commit()
-            conn.close()
-
-            st.cache_data.clear()
-            # 重查並重整 session_state 資料集 (bookings_df)
-            refresh_session_state_data()
-            # SQLite 寫入成功後，即時同步至 Google Sheets
-            sync_db_to_google_sheet()
-            current_user = st.session_state.get("authenticated_user", "管理員")
-            add_audit_log(
-                current_user,
-                "編輯訂單",
-                f"更新訂單 {booking_code} (ID {booking_id}) 基本資料",
-            )
-            trigger_auto_sync(current_user)
-            st.success(f"已更新！訂單 {booking_code} 的修改已儲存。")
-            st.rerun()
-
-    # ==========================
-    # 刪除行動 (獨立按鈕 + 確認勾選框，避免誤刪)
-    # ==========================
-    st.markdown("#### 🗑️ 刪除預約")
-    guest_name = str(selected_booking.get("name") or "")
-    check_in_text = str(selected_booking.get("check_in_date") or "")
-    delete_confirmed = st.checkbox(
-        f"我確認要刪除訂單 {booking_code}（{guest_name}，入住 {check_in_text}）",
-        key=f"manage_delete_chk_{booking_id}",
-    )
-    if st.button(
-        "🗑️ 刪除此預約",
-        key=f"manage_delete_btn_{booking_id}",
-        type="primary",
-        use_container_width=True,
-    ):
-        if not delete_confirmed:
-            st.error("請先勾選確認刪除，再執行刪除動作。")
-        else:
-            # 刪除後端：DELETE ... WHERE id = ? → 重查並重整
-            # session_state 資料集 → 即時同步 Google Sheets →
-            # 稽核日誌 → 自動備份
-            execute_delete_booking(booking_id, dict(selected_booking))
-            st.warning(f"已刪除！訂單 {booking_code} 已自資料庫移除。")
-            st.rerun()
 
 
 # ==============================================================================
@@ -3154,7 +3155,6 @@ def main():
         "📊 營位總覽看板",
         "➕ 新增露營預約",
         "🔍 訂位管理與搜尋",
-        "✏️ 預約管理",
         "⚙️ 系統管理",
     ]
 
@@ -3235,8 +3235,6 @@ def main():
         render_booking_form_view()
     elif page_selection == "🔍 訂位管理與搜尋":
         render_bookings_view()
-    elif page_selection == "✏️ 預約管理":
-        render_booking_manage_view()
     elif page_selection == "⚙️ 系統管理":
         render_system_management_view()
 
