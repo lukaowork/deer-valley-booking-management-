@@ -2304,6 +2304,47 @@ def render_booking_form_view(is_quick_mode: bool = False):
 # ==============================================================================
 # 10. 頁面功能：Excel/CSV 匯入與匯出 (Import / Export)
 # ==============================================================================
+def match_import_notes_column(columns) -> Optional[str]:
+    """批次匯入檔案的備註欄位靈活配對
+
+    依優先順序配對：備註 > 備註說明 > 空白文字備註 >
+    notes > remarks > 說明，確保不同來源的 XLSX/CSV
+    備註欄位皆能正確讀入。
+    """
+    return next(
+        (c for c in ["備註", "備註說明", "空白文字備註", "notes", "remarks", "說明"] if c in columns),
+        None,
+    )
+
+
+def parse_import_notes(row: Any, notes_col: Optional[str]) -> str:
+    """解析批次匯入列的備註內容
+
+    依配對到的備註欄位讀取，NaN/None 或空白儲存格安全轉為
+    空字串；並合併「地區/注意/車宿/寵物/其他」等補充欄位，
+    以「 | 」連接。
+    """
+    # 備註主欄位解析 (NaN/空白安全轉為空字串)
+    base_notes = ""
+    if notes_col:
+        raw_notes = row.get(notes_col)
+        if raw_notes is not None and not pd.isna(raw_notes):
+            parsed_notes = str(raw_notes).strip()
+            if parsed_notes and parsed_notes.lower() not in ["nan", "none", "null"]:
+                base_notes = parsed_notes
+
+    # 備註整合邏輯 (合併 "地區", "注意", "車宿", "寵物", "其他")
+    notes_parts = []
+    if base_notes:
+        notes_parts.append(base_notes)
+    for col_name in ["地區", "注意", "車宿", "寵物", "其他"]:
+        val = str(row.get(col_name, "")).strip()
+        if val and val.lower() not in ["nan", "none", "null"]:
+            notes_parts.append(f"{col_name}: {val}")
+
+    return " | ".join(notes_parts)
+
+
 def render_import_export_view():
     st.markdown("### 📤 Excel / CSV 批次資料匯入與匯出")
 
@@ -2459,6 +2500,9 @@ def render_import_export_view():
                     current_user = st.session_state.get("authenticated_user", "管理員")
                     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+                    # 備註欄位靈活配對 (詳見 match_import_notes_column)
+                    notes_col = match_import_notes_column(df_upload.columns)
+
                     conn = get_db_connection()
                     cursor = conn.cursor()
 
@@ -2541,18 +2585,8 @@ def render_import_export_view():
                             if tag not in CUSTOMER_TAGS:
                                 tag = "一般"
 
-                            # 備註整合邏輯 (合併 "地區", "注意", "車宿", "寵物", "其他")
-                            notes_parts = []
-                            for col_name in ["地區", "注意", "車宿", "寵物", "其他"]:
-                                val = str(row.get(col_name, "")).strip()
-                                if val and val.lower() not in ["nan", "none", "null"]:
-                                    notes_parts.append(f"{col_name}: {val}")
-                            
-                            base_notes = str(row.get("空白文字備註", row.get("notes", ""))).strip()
-                            if base_notes and base_notes.lower() not in ["nan", "none", "null"]:
-                                notes_parts.insert(0, base_notes)
-                            
-                            notes = " | ".join(notes_parts)
+                            # 備註解析 (NaN/空白安全處理，詳見 parse_import_notes)
+                            notes = parse_import_notes(row, notes_col)
 
                             if not name or not phone:
                                 skip_count += 1
