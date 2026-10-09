@@ -2341,12 +2341,14 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 has_night_rush = 1 if has_night_rush else 0
 
+                # 開啟單一資料庫連線，確保交易原子性
                 conn = get_db_connection()
                 cursor = conn.cursor()
+                save_ok = False
 
                 try:
                     if is_editing:
-                        # 更新現有訂單
+                        # 更新現有訂單 (全欄位)
                         cursor.execute(
                             """
                             UPDATE bookings
@@ -2373,24 +2375,14 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 editing_id,
                             ),
                         )
+                        # 查詢執行後立即提交交易
                         conn.commit()
-                        st.cache_data.clear()
-                        # SQLite 寫入成功後，即時同步至 Google Sheets
-                        sync_db_to_google_sheet()
                         add_audit_log(
                             current_user,
                             "修改訂單",
                             f"修改訂單 {booking_data['booking_code']} (客戶: {name_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 總額: {calc_total})",
                         )
-                        st.session_state["editing_booking_id"] = None
-                        st.session_state["editing_booking_data"] = None
-                        reset_booking_form_date_keys()
-                        st.success("✅ 訂單內容已成功修改更新！")
-                        time.sleep(3)
-                        
-                        if is_quick_mode:
-                            st.session_state["show_quick_booking_form"] = False
-                            st.rerun()
+                        save_ok = True
                     else:
                         # 新增訂單
                         b_code = generate_booking_code(check_in_val)
@@ -2422,33 +2414,39 @@ def render_booking_form_view(is_quick_mode: bool = False):
                                 now_str,
                             ),
                         )
+                        # 查詢執行後立即提交交易
                         conn.commit()
-                        st.cache_data.clear()
-                        # SQLite 寫入成功後，即時同步至 Google Sheets
-                        sync_db_to_google_sheet()
                         add_audit_log(
                             current_user,
                             "新增訂單",
                             f"新增訂單 {b_code} (客戶: {name_val}, 電話: {phone_val}, 區域: {area_val}, 總帳數: {total_qty}, 夜衝: {total_rush_qty}, 入住: {check_in_val}, 金額: {calc_total})",
                         )
-                        st.success(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}")
-                        reset_booking_form_date_keys()
-
-                        if is_quick_mode:
-                            st.session_state["show_quick_booking_form"] = False
-                            st.rerun()
-
-                    conn.close()
-                    # 立即重查並重整 session_state 資料集，隨後 st.rerun()
-                    # 讓 UI 即時呈現最新訂單 (一般模式亦立即重整)
-                    refresh_session_state_data()
-                    # 觸發雲端與本地自動同步備份
-                    trigger_auto_sync(current_user)
-                    st.balloons()
-                    st.rerun()
+                        save_ok = True
                 except Exception as e:
-                    conn.close()
                     st.error(f"儲存訂單時發生錯誤: {e}")
+
+                # 交易完成後才關閉連線，確保 SQLite 寫入已持久化
+                conn.close()
+
+                if save_ok:
+                    # 清除快取並重整本地資料集
+                    st.cache_data.clear()
+                    refresh_session_state_data()
+                    # 推送同步 Google Sheets
+                    sync_db_to_google_sheet()
+                    # 重置編輯狀態
+                    st.session_state["editing_booking_id"] = None
+                    st.session_state["editing_booking_data"] = None
+                    reset_booking_form_date_keys()
+                    # 成功通知
+                    if is_editing:
+                        st.toast("✅ 訂單資料已成功修改並同步！", icon="🎉")
+                        time.sleep(3)
+                    else:
+                        st.toast(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}", icon="🎉")
+                    # 觸發自動備份並立即重跑 (最後一刻才重跑)
+                    trigger_auto_sync(current_user)
+                    st.rerun()
 
 
 # ==============================================================================
