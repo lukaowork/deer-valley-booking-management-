@@ -10,6 +10,7 @@
 import io
 import json
 import os
+import re
 import sqlite3
 import time
 from datetime import date, datetime, timedelta
@@ -942,6 +943,194 @@ def sync_db_to_google_sheet() -> bool:
     except Exception as e:
         st.warning(f"⚠️ Google Sheets 即時同步失敗（SQLite 資料不受影響）：{e}")
         return False
+
+
+def _normalize_text(value: Any) -> str:
+    """字串標準化：去除首尾空白"""
+    return "" if value is None else str(value).strip()
+
+
+def _normalize_phone(value: Any) -> str:
+    """電話格式標準化：去除空格、破折號與括號，確保跨系統比對一致"""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    for ch in (" ", "　", "-", "－", "(", ")", "（", "）"):
+        s = s.replace(ch, "")
+    return s
+
+
+def _normalize_date_str(value: Any) -> str:
+    """日期字串標準化為 YYYY-MM-DD
+
+    支援 Google Sheets 常見格式：2026-10-25、2026/10/25、
+    2026年10月25日、2026-10-25 00:00:00、純數字 20261025。
+    """
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    m = re.search(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return s[:10]
+
+
+def _normalize_int(value: Any, default: int = 0) -> int:
+    """數值標準化：轉換失敗時回傳預設值"""
+    try:
+        return int(float(str(value).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def pull_google_sheet_to_db() -> Tuple[int, int]:
+    """從 Google Sheets「訂單紀錄」分頁拉取訂單，經嚴格去重後匯入本機 SQLite
+
+    去重規則 (複合唯一約束)：入住日期 (check_in_date) + 露營人姓名 (name) +
+    露營人電話 (phone) 三者完全一致即視為同一筆訂單，跳過插入；
+    僅將 SQLite 不存在的新訂單寫入資料庫並更新 st.session_state。
+
+    比對前會先標準化欄位格式 (去除空白、電話去符號、日期統一為
+    YYYY-MM-DD)，以容忍 Sheets 與 SQLite 之間的格式差異。
+
+    回傳 (新增筆數, 跳過重複筆數)；試算表不可達或憑證缺失等任何失敗
+    均僅背景記錄日誌並回傳 (0, 0)，不會中斷 UI 流程。
+    """
+    try:
+        spreadsheet_id = get_spreadsheet_id()
+        if not spreadsheet_id:
+            print("[Google Sheets Pull] 未設定試算表 ID，跳過啟動拉取")
+            return 0, 0
+
+        client = get_gspread_client()
+        spreadsheet = client.open_by_key(spreadsheet_id)
+
+        # 取得目標工作表 (若不存在視為尚無雲端資料可拉取)
+        worksheet = None
+        for ws in spreadsheet.worksheets():
+            if ws.title == GSHEET_WORKSHEET_TITLE:
+                worksheet = ws
+                break
+        if worksheet is None:
+            print(f"[Google Sheets Pull] 工作表「{GSHEET_WORKSHEET_TITLE}」不存在，跳過")
+            return 0, 0
+
+        rows = worksheet.get_all_values()
+        if not rows or len(rows) < 2:
+            return 0, 0
+
+        # 建立中文標頭 → SQLite 欄位反向對照
+        header_to_column = {chinese: col for col, chinese in GSHEET_COLUMN_MAP.items()}
+        header = [str(h).strip() for h in rows[0]]
+        column_index = {}
+        for idx, h in enumerate(header):
+            col = header_to_column.get(h)
+            if col:
+                column_index[col] = idx
+
+        # 必要欄位檢查 (去重複合鍵 + 入住/退房日)
+        required = ("check_in_date", "name", "phone", "check_out_date")
+        missing = [c for c in required if c not in column_index]
+        if missing:
+            print(f"[Google Sheets Pull] 工作表缺少必要欄位 {missing}，跳過")
+            return 0, 0
+
+        def _cell(row: List[Any], col: str, default: str = "") -> str:
+            idx = column_index.get(col)
+            if idx is None or idx >= len(row):
+                return default
+            return str(row[idx]).strip()
+
+        # 讀取 SQLite 既有訂單的複合鍵集合 (標準化後比對)
+        conn = get_db_connection()
+        existing_keys = set()
+        for r in conn.execute("SELECT check_in_date, name, phone FROM bookings").fetchall():
+            existing_keys.add((
+                _normalize_date_str(r[0]),
+                _normalize_text(r[1]),
+                _normalize_phone(r[2]),
+            ))
+
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        inserted, skipped = 0, 0
+        new_records = []
+        for raw in rows[1:]:
+            row = list(raw) + [""] * max(0, len(header) - len(raw))
+
+            check_in_str = _normalize_date_str(_cell(row, "check_in_date"))
+            name_val = _normalize_text(_cell(row, "name"))
+            phone_val = _normalize_phone(_cell(row, "phone"))
+            check_out_str = _normalize_date_str(_cell(row, "check_out_date"))
+
+            # 空白列或關鍵欄位缺失則跳過
+            if not check_in_str or not name_val or not phone_val or not check_out_str:
+                continue
+
+            # 複合唯一約束去重：(入住日期, 姓名, 電話) 已存在即跳過
+            composite_key = (check_in_str, name_val, phone_val)
+            if composite_key in existing_keys:
+                skipped += 1
+                continue
+
+            booking_code = _cell(row, "booking_code") or generate_booking_code(date.today())
+            night_rush_raw = _cell(row, "night_rush").lower()
+            new_records.append((
+                booking_code,
+                check_in_str,
+                check_out_str,
+                name_val,
+                phone_val,
+                _cell(row, "area"),
+                _normalize_int(_cell(row, "quantity"), 1) or 1,
+                1 if night_rush_raw in ("1", "true", "是", "y", "yes") else 0,
+                _normalize_int(_cell(row, "night_rush_quantity"), 0),
+                _cell(row, "night_rush_detail"),
+                _normalize_int(_cell(row, "visit_count"), 1) or 1,
+                _cell(row, "tag") or "一般",
+                _cell(row, "notes"),
+                _normalize_int(_cell(row, "total_amount"), 0),
+                _cell(row, "created_by") or "系統匯入",
+                _cell(row, "created_at") or now_str,
+                _cell(row, "updated_at") or now_str,
+            ))
+            # 同步加入集合，避免同一批次內重複插入
+            existing_keys.add(composite_key)
+            inserted += 1
+
+        # 批次插入新訂單並清除資料快取
+        if new_records:
+            conn.executemany(
+                """
+                INSERT INTO bookings (
+                    booking_code, check_in_date, check_out_date, name, phone,
+                    area, quantity, night_rush, night_rush_quantity, night_rush_detail,
+                    visit_count, tag, notes, total_amount, created_by, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                new_records,
+            )
+            conn.commit()
+            st.cache_data.clear()
+        conn.close()
+
+        # 更新 session_state 啟動拉取狀態
+        st.session_state["gsheet_startup_pull_done"] = True
+        st.session_state["gsheet_last_pull_at"] = now_str
+        st.session_state["gsheet_last_pull_new"] = inserted
+        st.session_state["gsheet_last_pull_skipped"] = skipped
+
+        print(f"[Google Sheets Pull] 啟動拉取完成：新增 {inserted} 筆，跳過重複 {skipped} 筆")
+        return inserted, skipped
+    except Exception as e:
+        # 試算表不可達/憑證異常等皆不中斷 UI，僅背景記錄
+        print(f"[Google Sheets Pull] 啟動拉取失敗 (UI 不受影響)：{e}")
+        st.session_state["gsheet_startup_pull_done"] = True
+        return 0, 0
 
 
 def backup_database_to_google_sheets_full() -> Tuple[bool, str]:
@@ -2650,6 +2839,11 @@ def main():
     init_db()
     load_data()
     init_admins()
+
+    # 啟動/登入時自動從 Google Sheets 拉取訂單並嚴格去重匯入
+    # (每個瀏覽器階段僅執行一次)；試算表不可達時不中斷 UI，僅背景記錄
+    if not st.session_state.get("gsheet_startup_pull_done"):
+        pull_google_sheet_to_db()
 
     # 檢查是否因 60 秒無動作觸發資安自動登出
     if st.query_params.get("auto_logout") == "1":
