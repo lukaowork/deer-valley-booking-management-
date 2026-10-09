@@ -2385,7 +2385,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         st.session_state["editing_booking_id"] = None
                         st.session_state["editing_booking_data"] = None
                         reset_booking_form_date_keys()
-                        st.toast("✅ 預約內容已成功更新！")
+                        st.success("✅ 訂單內容已成功修改更新！")
                         time.sleep(3)
                         
                         if is_quick_mode:
