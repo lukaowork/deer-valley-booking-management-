@@ -2157,19 +2157,99 @@ def render_booking_form_view(is_quick_mode: bool = False):
             default_check_in = date.today() + timedelta(days=1)
         default_check_out = default_check_in + timedelta(days=1)
 
+    # 表單 widget 唯一鍵值（綁定 session_state，確保編輯切換時正確帶入預填值）
+    FORM_NAME_KEY = "booking_form_name"
+    FORM_PHONE_KEY = "booking_form_phone"
+    FORM_TAG_KEY = "booking_form_tag"
+    FORM_VISIT_KEY = "booking_form_visit"
+    FORM_NOTES_KEY = "booking_form_notes"
+    FORM_QTY_SHELTER_KEY = "booking_form_qty_shelter"
+    FORM_RUSH_SHELTER_KEY = "booking_form_rush_shelter"
+    FORM_QTY_GRASS_KEY = "booking_form_qty_grass"
+    FORM_RUSH_GRASS_KEY = "booking_form_rush_grass"
+    FORM_QTY_ROOM_KEY = "booking_form_qty_room"
+    FORM_RUSH_ROOM_KEY = "booking_form_rush_room"
+
+    # 跨區數量與各區獨立夜衝數量初始化（從 form 內移出，供種子化使用）
+    if is_quick_mode:
+        # 快速預約模式一律歸零
+        canopy_qty = 0
+        grass_qty = 0
+        room_qty = 0
+        canopy_night_qty = 0
+        grass_night_qty = 0
+        room_night_qty = 0
+    elif is_editing and booking_data:
+        # 編輯模式：精準還原原訂單各區域數量 (禁止直接歸零)
+        # 舊格式無括號字串時，以訂單總數量作為該區域數量
+        fallback_total = int(booking_data.get("quantity", 0) or 0)
+        parsed_defaults = parse_area_quantities(default_area, fallback_total)
+        canopy_qty = parsed_defaults.get("雨棚區", 0)
+        grass_qty = parsed_defaults.get("草地區", 0)
+        room_qty = parsed_defaults.get("通舖房間", 0)
+        # 各區獨立夜衝數量：優先解析 night_rush_detail 明細
+        rush_detail_str = str(booking_data.get("night_rush_detail") or "")
+        if rush_detail_str:
+            parsed_rush = parse_area_quantities(rush_detail_str, 0)
+            canopy_night_qty = parsed_rush.get("雨棚區", 0)
+            grass_night_qty = parsed_rush.get("草地區", 0)
+            room_night_qty = parsed_rush.get("通舖房間", 0)
+        else:
+            # 舊資料相容：無明細時將夜衝總數配給首個有預約的區域
+            canopy_night_qty = 0
+            grass_night_qty = 0
+            room_night_qty = 0
+            old_rush_qty = int(booking_data.get("night_rush_quantity", 0) or 0)
+            if old_rush_qty > 0:
+                if canopy_qty > 0:
+                    canopy_night_qty = min(canopy_qty, old_rush_qty)
+                elif grass_qty > 0:
+                    grass_night_qty = min(grass_qty, old_rush_qty)
+                elif room_qty > 0:
+                    room_night_qty = min(room_qty, old_rush_qty)
+    else:
+        # 一般新增模式：全部歸零
+        canopy_qty = 0
+        grass_qty = 0
+        room_qty = 0
+        canopy_night_qty = 0
+        grass_night_qty = 0
+        room_night_qty = 0
+
+    # 偵測編輯內容切換：切換編輯對象（或進入/退出編輯模式）時，
+    # 以 booking_data 種子化 widget 狀態，確保預填值生效且使用者修改可被捕捉
+    _form_ctx = f"{'quick' if is_quick_mode else 'normal'}_{editing_id or 'new'}"
+    if st.session_state.get("booking_form_ctx") != _form_ctx:
+        st.session_state["booking_form_ctx"] = _form_ctx
+        st.session_state[FORM_NAME_KEY] = default_name
+        st.session_state[FORM_PHONE_KEY] = default_phone
+        if default_tag in CUSTOMER_TAGS:
+            st.session_state[FORM_TAG_KEY] = default_tag
+        st.session_state[FORM_VISIT_KEY] = int(default_visit_count)
+        st.session_state[FORM_NOTES_KEY] = default_notes
+        st.session_state[FORM_QTY_SHELTER_KEY] = int(min(8, canopy_qty))
+        st.session_state[FORM_RUSH_SHELTER_KEY] = int(min(min(8, canopy_qty), canopy_night_qty))
+        st.session_state[FORM_QTY_GRASS_KEY] = int(min(4, grass_qty))
+        st.session_state[FORM_RUSH_GRASS_KEY] = int(min(min(4, grass_qty), grass_night_qty))
+        st.session_state[FORM_QTY_ROOM_KEY] = int(min(2, room_qty))
+        st.session_state[FORM_RUSH_ROOM_KEY] = int(min(min(2, room_qty), room_night_qty))
+        st.session_state[FORM_CHECK_IN_KEY] = default_check_in
+        st.session_state[FORM_CHECK_OUT_KEY] = default_check_out
+        st.session_state[FORM_PREV_CHECK_IN_KEY] = default_check_in
+
     with st.form("booking_editor_form"):
         st.markdown("#### 1. 露營客基本資料")
         col_c1, col_c2, col_c3 = st.columns([1.2, 1.2, 1])
 
         with col_c1:
-            name_val = st.text_input("露營人姓名 *", value=default_name, placeholder="例如：王小明")
+            name_val = st.text_input("露營人姓名 *", key=FORM_NAME_KEY, placeholder="例如：王小明")
         with col_c2:
-            phone_val = st.text_input("露營人電話 *", value=default_phone, placeholder="例如：0912345678")
+            phone_val = st.text_input("露營人電話 *", key=FORM_PHONE_KEY, placeholder="例如：0912345678")
         with col_c3:
             tag_val = st.selectbox(
                 "客戶標籤 *",
                 options=CUSTOMER_TAGS,
-                index=CUSTOMER_TAGS.index(default_tag) if default_tag in CUSTOMER_TAGS else 0,
+                key=FORM_TAG_KEY,
             )
 
         # 自動統計來訪次數
@@ -2182,7 +2262,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 "來過次數 (系統自動統計或手動微調)",
                 min_value=1,
                 max_value=999,
-                value=int(calc_visit_count),
+                key=FORM_VISIT_KEY,
                 help="輸入電話時若已存在歷史訂單，系統會自動參考歷史到訪紀錄。",
             )
 
@@ -2191,65 +2271,19 @@ def render_booking_form_view(is_quick_mode: bool = False):
 
         col_b1, col_b2, col_b3 = st.columns(3)
 
-        # 跨區數量與各區獨立夜衝數量初始化
-        if is_quick_mode:
-            # 快速預約模式一律歸零
-            canopy_qty = 0
-            grass_qty = 0
-            room_qty = 0
-            canopy_night_qty = 0
-            grass_night_qty = 0
-            room_night_qty = 0
-        elif is_editing and booking_data:
-            # 編輯模式：精準還原原訂單各區域數量 (禁止直接歸零)
-            # 舊格式無括號字串時，以訂單總數量作為該區域數量
-            fallback_total = int(booking_data.get("quantity", 0) or 0)
-            parsed_defaults = parse_area_quantities(default_area, fallback_total)
-            canopy_qty = parsed_defaults.get("雨棚區", 0)
-            grass_qty = parsed_defaults.get("草地區", 0)
-            room_qty = parsed_defaults.get("通舖房間", 0)
-            # 各區獨立夜衝數量：優先解析 night_rush_detail 明細
-            rush_detail_str = str(booking_data.get("night_rush_detail") or "")
-            if rush_detail_str:
-                parsed_rush = parse_area_quantities(rush_detail_str, 0)
-                canopy_night_qty = parsed_rush.get("雨棚區", 0)
-                grass_night_qty = parsed_rush.get("草地區", 0)
-                room_night_qty = parsed_rush.get("通舖房間", 0)
-            else:
-                # 舊資料相容：無明細時將夜衝總數配給首個有預約的區域
-                canopy_night_qty = 0
-                grass_night_qty = 0
-                room_night_qty = 0
-                old_rush_qty = int(booking_data.get("night_rush_quantity", 0) or 0)
-                if old_rush_qty > 0:
-                    if canopy_qty > 0:
-                        canopy_night_qty = min(canopy_qty, old_rush_qty)
-                    elif grass_qty > 0:
-                        grass_night_qty = min(grass_qty, old_rush_qty)
-                    elif room_qty > 0:
-                        room_night_qty = min(room_qty, old_rush_qty)
-        else:
-            # 一般新增模式：全部歸零
-            canopy_qty = 0
-            grass_qty = 0
-            room_qty = 0
-            canopy_night_qty = 0
-            grass_night_qty = 0
-            room_night_qty = 0
-        
         with col_b1:
-            qty_shelter = st.number_input("雨棚區 (帳數)", min_value=0, max_value=8, value=min(8, canopy_qty))
-            rush_shelter = st.number_input("⚡ 雨棚區夜衝 (帳數)", min_value=0, max_value=8, value=min(qty_shelter, canopy_night_qty))
+            qty_shelter = st.number_input("雨棚區 (帳數)", min_value=0, max_value=8, key=FORM_QTY_SHELTER_KEY)
+            rush_shelter = st.number_input("⚡ 雨棚區夜衝 (帳數)", min_value=0, max_value=8, key=FORM_RUSH_SHELTER_KEY)
             if rush_shelter > qty_shelter:
                 st.warning("雨棚區夜衝數量不可大於預約數量！")
         with col_b2:
-            qty_grass = st.number_input("草地區 (帳數)", min_value=0, max_value=4, value=min(4, grass_qty))
-            rush_grass = st.number_input("⚡ 草地區夜衝 (帳數)", min_value=0, max_value=4, value=min(qty_grass, grass_night_qty))
+            qty_grass = st.number_input("草地區 (帳數)", min_value=0, max_value=4, key=FORM_QTY_GRASS_KEY)
+            rush_grass = st.number_input("⚡ 草地區夜衝 (帳數)", min_value=0, max_value=4, key=FORM_RUSH_GRASS_KEY)
             if rush_grass > qty_grass:
                 st.warning("草地區夜衝數量不可大於預約數量！")
         with col_b3:
-            qty_room = st.number_input("通舖房間 (間數)", min_value=0, max_value=2, value=min(2, room_qty))
-            rush_room = st.number_input("⚡ 通舖夜衝 (間數)", min_value=0, max_value=2, value=min(qty_room, room_night_qty))
+            qty_room = st.number_input("通舖房間 (間數)", min_value=0, max_value=2, key=FORM_QTY_ROOM_KEY)
+            rush_room = st.number_input("⚡ 通舖夜衝 (間數)", min_value=0, max_value=2, key=FORM_RUSH_ROOM_KEY)
             if rush_room > qty_room:
                 st.warning("通舖房間夜衝數量不可大於預約數量！")
 
@@ -2305,7 +2339,7 @@ def render_booking_form_view(is_quick_mode: bool = False):
         if qty_shelter >= 6:
             st.info("🏷️ **雨棚區包區提示**：雨棚預約達 6 帳以上，系統自動認定為【雨棚區包區】，營位總覽看板將連動保留雨棚區 1~8 號全區！")
 
-        notes_val = st.text_area("空白文字備註 (特殊需求、車牌、同團成員等)", value=default_notes, placeholder="請在此自由填寫備註...")
+        notes_val = st.text_area("空白文字備註 (特殊需求、車牌、同團成員等)", key=FORM_NOTES_KEY, placeholder="請在此自由填寫備註...")
 
         # 即時費用計算 (傳入各區獨立夜衝明細)
         calc_total, nights_count, base_fee, rush_fee = calculate_booking_fee(
@@ -3067,10 +3101,11 @@ def main():
     if deduplicate_bookings() > 0:
         st.cache_data.clear()
 
-    # 強制啟動拉取：每次載入應用程式皆自動從 Google Sheets 拉取訂單
-    # 並嚴格去重匯入 SQLite (不依賴手動觸發或被動的 session_state 檢查)；
-    # 試算表不可達時畫面顯示警告但不中斷 UI
-    pull_google_sheet_to_db()
+    # 啟動拉取：僅於應用程式首次啟動時執行一次，
+    # 避免每次重跑皆從 Google Sheets 拉取舊資料覆寫剛寫入 SQLite 的更新
+    if not st.session_state.get("gsheet_startup_pull_done", False):
+        pull_google_sheet_to_db()
+        st.session_state["gsheet_startup_pull_done"] = True
 
     # 同步完成後重新查詢全量訂單並寫入 session_state，
     # 確保表格/指標/日曆等 UI 元件取得非空資料
