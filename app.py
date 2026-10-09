@@ -1710,6 +1710,8 @@ def render_dashboard_view():
                         del_conn.commit()
                         del_conn.close()
                         st.cache_data.clear()
+                        # 立即重查並重整 session_state 資料集，UI 即時反映刪除結果
+                        refresh_session_state_data()
                         # SQLite 寫入成功後，即時同步至 Google Sheets
                         sync_db_to_google_sheet()
                         add_audit_log(
@@ -1932,6 +1934,8 @@ def render_bookings_view():
                                 del_conn.close()
 
                                 st.cache_data.clear()
+                                # 立即重查並重整 session_state 資料集，UI 即時反映刪除結果
+                                refresh_session_state_data()
                                 # SQLite 寫入成功後，即時同步至 Google Sheets
                                 sync_db_to_google_sheet()
                                 add_audit_log(
@@ -2048,8 +2052,17 @@ def render_booking_form_view(is_quick_mode: bool = False):
     default_visit_count = booking_data["visit_count"] if is_editing else 1
 
     if is_editing:
-        default_check_in = datetime.strptime(booking_data["check_in_date"], "%Y-%m-%d").date()
-        default_check_out = datetime.strptime(booking_data["check_out_date"], "%Y-%m-%d").date()
+        # 安全解析入住/退房日期：批次匯入的歷史記錄可能為
+        # 「歷史客戶/無預約日期」等占位字串，解析失敗時回退至今天，
+        # 避免編輯表單因 ValueError 無法開啟
+        try:
+            default_check_in = datetime.strptime(str(booking_data["check_in_date"]), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            default_check_in = date.today()
+        try:
+            default_check_out = datetime.strptime(str(booking_data["check_out_date"]), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            default_check_out = date.today() + timedelta(days=1)
     else:
         # 快速預約：自動帶入點選日期 (優先 selected_booking_date，相容 quick_booking_date / selected_date)
         quick_date = (
@@ -2342,15 +2355,19 @@ def render_booking_form_view(is_quick_mode: bool = False):
                         )
                         st.success(f"🎉 訂單建立成功！訂單編號：{b_code}，總金額：NT$ {calc_total:,}")
                         reset_booking_form_date_keys()
-                        
+
                         if is_quick_mode:
                             st.session_state["show_quick_booking_form"] = False
                             st.rerun()
 
                     conn.close()
+                    # 立即重查並重整 session_state 資料集，隨後 st.rerun()
+                    # 讓 UI 即時呈現最新訂單 (一般模式亦立即重整)
+                    refresh_session_state_data()
                     # 觸發雲端與本地自動同步備份
                     trigger_auto_sync(current_user)
                     st.balloons()
+                    st.rerun()
                 except Exception as e:
                     conn.close()
                     st.error(f"儲存訂單時發生錯誤: {e}")
