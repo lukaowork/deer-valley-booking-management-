@@ -2083,6 +2083,16 @@ FORM_CHECK_OUT_KEY = "booking_form_check_out_date"
 FORM_PREV_CHECK_IN_KEY = "booking_form_prev_check_in"
 
 
+def on_check_in_change():
+    """入住日期變更 callback：自動計算並連動退房日期為入住後 1 天"""
+    if FORM_CHECK_IN_KEY in st.session_state:
+        check_in = st.session_state[FORM_CHECK_IN_KEY]
+        # 更新預設退房日為入住隔天
+        new_check_out = check_in + timedelta(days=1)
+        st.session_state[FORM_CHECK_OUT_KEY] = new_check_out
+        st.session_state[FORM_PREV_CHECK_IN_KEY] = check_in
+
+
 def reset_booking_form_date_keys():
     """重置表單日期鍵值，讓表單下次渲染時正確帶入預設的入住/退房日期"""
     for _dk in (FORM_CHECK_IN_KEY, FORM_CHECK_OUT_KEY, FORM_PREV_CHECK_IN_KEY):
@@ -2387,6 +2397,28 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 current_user = st.session_state.get("authenticated_user", "管理員")
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 has_night_rush = 1 if has_night_rush else 0
+                
+                # 執行寫入 (SQL)
+                conn = get_db_connection()
+                if is_editing:
+                    # 使用絕對路徑
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE bookings SET name=?, phone=?, check_in_date=?, check_out_date=?, area=?, notes=? WHERE id=?",
+                        (name_val, phone_val, check_in_val.strftime("%Y-%m-%d"), check_out_val.strftime("%Y-%m-%d"), area_str, notes_val, editing_id)
+                    )
+                    conn.commit()
+                    st.success("✅ 預約內容已成功更新！")
+                    time.sleep(3)
+                    st.session_state["editing_booking_id"] = None
+                else:
+                    # (略過新增的寫入邏輯)
+                    pass
+                conn.close()
+                
+                # 同步 Google Sheets
+                push_to_sheets() 
+                st.rerun()
 
                 conn = get_db_connection()
                 cursor = conn.cursor()
