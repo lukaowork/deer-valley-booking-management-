@@ -1688,7 +1688,7 @@ def render_dashboard_view():
                         if rush_qty > 0:
                             has_night_rush = True
                 
-                # 格子容器開頭：圓角微邊框 + 內襯 + 當日/選取日高亮 (Flex 佈局)
+                # 格子容器：單一自包含 HTML 卡片，所有徽章盡在容器內
                 if is_selected:
                     cell_border, cell_bg = "#1565C0", "#E3F2FD"
                 elif is_today:
@@ -1696,6 +1696,27 @@ def render_dashboard_view():
                 else:
                     cell_border, cell_bg = "#E0E0E0", "#FFFFFF"
 
+                # 區域摘要徽章 (compact font, font-weight 600)
+                badges = []
+                if summary["雨棚區"] > 0:
+                    badges.append(f'<span style="font-size:0.85rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</span>')
+                if summary["草地區"] > 0:
+                    badges.append(f'<span style="font-size:0.85rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</span>')
+                if summary["通舖房間"] > 0:
+                    badges.append(f'<span style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</span>')
+
+                # 特徵膠囊標籤 (soft padding, inline pills)
+                tags = []
+                if has_group:
+                    tags.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 8px; border-radius:999px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span>')
+                if has_night_rush:
+                    tags.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 8px; border-radius:999px; font-size:0.75rem; font-weight:700;">⚡ 夜衝</span>')
+
+                # 組合所有徽章 (區域摘要 + 特徵標籤)
+                status_items = badges + tags
+                status_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; align-items:center; margin-top:4px; min-height:20px;">{"".join(status_items)}</div>' if status_items else '<div style="min-height:20px;"></div>'
+
+                # 卡片容器開頭：圓角微邊框 + 內襯 + 當日/選取日高亮
                 st.markdown(
                     f'<div style="border:1px solid {cell_border}; border-radius:8px; padding:8px; '
                     f'background:{cell_bg}; display:flex; flex-direction:column; gap:4px; min-height:120px;">'
@@ -1706,33 +1727,13 @@ def render_dashboard_view():
                     unsafe_allow_html=True,
                 )
 
-                # 日期按鈕
+                # 日期按鈕 (整合於卡片內，use_container_width 確保全寬)
                 if st.button(day_label, key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
                     st.session_state["dashboard_selected_date"] = dt
                     st.rerun()
-                
-                # 放大狀態點點 (深色圓點直徑 13px，文字 0.9rem / font-weight 600)
-                badges = []
-                if summary["雨棚區"] > 0:
-                    badges.append(f'<div style="font-size:0.9rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#2E7D32; margin-right:6px;"></span>雨棚 x{summary["雨棚區"]}</div>')
-                if summary["草地區"] > 0:
-                    badges.append(f'<div style="font-size:0.9rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#EF6C00; margin-right:6px;"></span>草地 x{summary["草地區"]}</div>')
-                if summary["通舖房間"] > 0:
-                    badges.append(f'<div style="font-size:0.9rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:13px; height:13px; border-radius:50%; background:#8E24AA; margin-right:6px;"></span>通鋪 x{summary["通舖房間"]}</div>')
-                
-                tags = []
-                if has_group:
-                    tags.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 10px; border-radius:999px; font-size:0.72rem; font-weight:700;">🏷️ 包區</span>')
-                if has_night_rush:
-                    tags.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 10px; border-radius:999px; font-size:0.72rem; font-weight:700;">⚡ 夜衝</span>')
-                
-                # 狀態點點與膠囊標籤同時並存於同一行 (例：🟢 雨棚 x6 🏷️ 包區)
-                status_items = badges + tags
-                status_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; align-items:center; margin-top:4px; min-height:22px;">{"".join(status_items)}</div>' if status_items else '<div style="min-height:22px;"></div>'
-                
-                # 關閉格子容器 (所有自訂 HTML 均帶 unsafe_allow_html=True)
-                final_html = f'{status_html}</div><div style="height:10px;"></div>'
-                st.markdown(final_html, unsafe_allow_html=True)
+
+                # 徽章內容 + 關閉卡片容器 (所有徽章盡在卡片 div 內)
+                st.markdown(f'{status_html}</div>', unsafe_allow_html=True)
 
     # 3. 日期點擊與側邊/下方「訂單資料抽屜 (Drawer)」
     selected_dt = st.session_state["dashboard_selected_date"]
