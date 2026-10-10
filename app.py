@@ -353,18 +353,22 @@ def check_booking_capacity(
         for d_str, areas in details["daily"].items():
             for area_name, info in areas.items():
                 if info["total"] > info["capacity"]:
-                    over_msgs.append(f"{d_str} {area_name} 已訂 {info['occupied']} 帳，新增 {info['requested']} 帳將達 {info['total']} 帳（上限 {info['capacity']} 帳）")
-        message = "⚠️ 警告：" + "；".join(over_msgs) + "，已爆單超額！"
+                    over = info["total"] - info["capacity"]
+                    over_msgs.append(f"{area_name}歷史已訂 {info['occupied']} 帳，新增 {info['requested']} 帳將達 {info['total']} 帳（上限 {info['capacity']} 帳），超出容量 {over} 帳！")
+        message = "⚠️ 警告：" + "；".join(over_msgs)
         return True, message, details
 
-    # 未超額：顯示目前區間最高已訂數量
+    # 未超額：顯示歷史已訂 + 本次預約 + 加總後剩餘容量
     peak_msgs = []
     for area_name in ("雨棚區", "草地區", "通舖房間"):
         if requested_qty.get(area_name, 0) > 0:
-            peak = max_occupied[area_name] - requested_qty[area_name]
+            historical = max_occupied[area_name] - requested_qty.get(area_name, 0)
+            req_qty = requested_qty[area_name]
+            projected_total = max_occupied[area_name]
             cap = CAMP_AREAS[area_name]["capacity"]
-            peak_msgs.append(f"{area_name}最高已訂 {peak} 帳，剩餘 {cap - peak} 帳")
-    message = "✅ 目前區間" + "；".join(peak_msgs) if peak_msgs else "✅ 目前區間無預訂"
+            remaining = cap - projected_total
+            peak_msgs.append(f"{area_name}歷史已訂 {historical} 帳，本次預約 {req_qty} 帳（加總後剩餘 {remaining} 帳）")
+    message = "✅ " + "；".join(peak_msgs) if peak_msgs else "✅ 目前區間無預訂"
     return False, message, details
 
 
