@@ -1949,6 +1949,24 @@ def render_dashboard_view():
                     st.session_state["dashboard_selected_date"] = dt
                     st.rerun()
 
+                # 超額紅色警示
+                _over_areas = []
+                if summary["雨棚區"] > CAMP_AREAS["雨棚區"]["capacity"]:
+                    _over_areas.append(f"雨棚 x{summary['雨棚區']}")
+                if summary["草地區"] > CAMP_AREAS["草地區"]["capacity"]:
+                    _over_areas.append(f"草地 x{summary['草地區']}")
+                if summary["通舖房間"] > CAMP_AREAS["通舖房間"]["capacity"]:
+                    _over_areas.append(f"通舖 x{summary['通舖房間']}")
+                if _over_areas:
+                    st.markdown(
+                        f"""
+                        <div style="background-color:#FFEBEE; border:2px solid #D32F2F; border-radius:8px; padding:6px 10px; margin:4px 0;">
+                            <span style="color:#D32F2F; font-weight:800; font-size:0.9rem;">🔴 超額：{'、'.join(_over_areas)}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
                 # 單一自包含 HTML 卡片：所有摘要與標籤盡在容器內
                 badges_list = []
                 if summary["雨棚區"] > 0:
@@ -2503,6 +2521,81 @@ def render_booking_form_view(is_quick_mode: bool = False):
 
         notes_val = st.text_area("空白文字備註 (特殊需求、車牌、同團成員等)", key=FORM_NOTES_KEY, placeholder="請在此自由填寫備註...")
 
+        # ==================================================================
+        # 即時容量驗證與超額保護
+        # ==================================================================
+        _requested = {
+            "雨棚區": int(qty_shelter),
+            "草地區": int(qty_grass),
+            "通舖房間": int(qty_room),
+        }
+        _exclude_id = editing_id if is_editing else None
+        _is_over, _msg, _details = check_booking_capacity(
+            check_in_val, check_out_val, _requested, _exclude_id
+        )
+
+        if _is_over:
+            st.markdown(
+                f"""
+                <div style="background-color:#FFEBEE; border:2px solid #D32F2F; border-radius:8px; padding:12px; margin:8px 0;">
+                    <div style="color:#D32F2F; font-weight:800; font-size:1rem;">{_msg}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            # 包區碰撞警告
+            if _requested["雨棚區"] >= 6 and not check_shelter_group_eligibility(
+                check_in_val, check_out_val, _requested["雨棚區"], _exclude_id
+            ):
+                st.markdown(
+                    """
+                    <div style="background-color:#FFF3E0; border-left:4px solid #FF9800; padding:8px 12px; margin:6px 0; border-radius:4px; color:#E65100; font-weight:600;">
+                        ⚠️ 該日期已有散客預約，無法套用包區標籤！將以普通多帳預約處理。
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+            # 管理員覆核勾選框
+            admin_overrule = st.checkbox(
+                "⚠️ 我已知悉超額，仍要強制儲存（特例處理）",
+                key="admin_overrule",
+            )
+            if admin_overrule:
+                st.session_state["admin_overrule_confirmed"] = True
+            else:
+                st.session_state["admin_overrule_confirmed"] = False
+        else:
+            st.markdown(
+                f"""
+                <div style="background-color:#E8F5E9; border-left:4px solid #4CAF50; padding:8px 12px; margin:6px 0; border-radius:4px; color:#2E7D32; font-weight:600;">
+                    {_msg}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            # 包區資格檢查（無超額時也提示）
+            if _requested["雨棚區"] >= 6:
+                if check_shelter_group_eligibility(
+                    check_in_val, check_out_val, _requested["雨棚區"], _exclude_id
+                ):
+                    st.markdown(
+                        """
+                        <div style="background-color:#FFF8E1; border-left:4px solid #FBC02D; padding:8px 12px; margin:6px 0; border-radius:4px; color:#F57F17; font-weight:600;">
+                            🏷️ 符合雨棚區包區資格（>= 6 帳且無散客預約）
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        """
+                        <div style="background-color:#FFF3E0; border-left:4px solid #FF9800; padding:8px 12px; margin:6px 0; border-radius:4px; color:#E65100; font-weight:600;">
+                            ⚠️ 該日期已有散客預約，無法套用包區標籤！將以普通多帳預約處理。
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
         # 即時費用計算 (傳入各區獨立夜衝明細)
         calc_total, nights_count, base_fee, rush_fee = calculate_booking_fee(
             area_val, total_qty, check_in_val, check_out_val, rush_val
@@ -2532,7 +2625,14 @@ def render_booking_form_view(is_quick_mode: bool = False):
                 st.error("❌ 請至少選擇一個區域並輸入數量！")
             elif check_out_val <= check_in_val:
                 st.error("❌ 退房日期必須在入住日期之後！")
+            elif _is_over and not st.session_state.get("admin_overrule_confirmed", False):
+                st.error("❌ 目前區間已爆單超額，未經管理員覆核無法儲存！")
             else:
+                # 超額強制寫入時自動附加系統記錄備註
+                if _is_over and st.session_state.get("admin_overrule_confirmed", False):
+                    _system_note = "[系統記錄：超額強制建立] "
+                    if _system_note not in (notes_val or ""):
+                        notes_val = _system_note + (notes_val or "")
                 current_user = st.session_state.get("authenticated_user", "管理員")
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 has_night_rush_flag = 1 if has_night_rush else 0
