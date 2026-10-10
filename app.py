@@ -1880,6 +1880,18 @@ def render_dashboard_view():
     # 2. 取出整批資料作快取計算與日曆網格渲染
     df_all = fetch_all_bookings_df()
 
+    # 初始化台灣國定假日查詢（含 fallback 機制）
+    try:
+        import holidays as _holidays_pkg
+        _current_year = st.session_state.get("dashboard_selected_date", date.today()).year
+        tw_holidays = _holidays_pkg.Taiwan(years=[_current_year, _current_year + 1])
+    except Exception:
+        # fallback: 常見國定假日靜態映射
+        tw_holidays = {}
+
+    # 補班日判斷（週六且為補班日）
+    _makeup_workdays = set()  # 可擴充為官方補班日清單
+
     import calendar
     cal = calendar.Calendar(firstweekday=0)
     base_dt = st.session_state["dash_calendar_base"]
@@ -1935,23 +1947,45 @@ def render_dashboard_view():
             with w_cols[i]:
                 is_selected = (dt == st.session_state["dashboard_selected_date"])
                 is_today = (dt == date.today())
-                
+
                 day_label = f"{dt.month}/{dt.day}" if dt.day == 1 else f"{dt.day}"
                 weekday_label = day_names[dt.weekday()]
                 btn_type = "primary" if is_selected else "secondary"
 
-                # 格子樣式 (選取/今日/一般)
-                if is_selected:
+                # 台灣國定假日檢查
+                holiday_name = tw_holidays.get(dt) if tw_holidays else None
+                is_makeup_workday = dt.weekday() == 5 and dt in _makeup_workdays  # 週六補班
+
+                # 假日標籤附加
+                if holiday_name:
+                    day_label = f"{day_label} ({holiday_name})"
+                if is_makeup_workday:
+                    day_label = f"{day_label} 💼補班"
+
+                # 格子樣式 (選取/今日/一般/假日)
+                if holiday_name:
+                    cell_border, cell_bg = "#C62828", "#FFEBEE"  # 假日粉紅色
+                elif is_selected:
                     cell_border, cell_bg = "#1565C0", "#E3F2FD"
                 elif is_today:
                     cell_border, cell_bg = "#2E7D32", "#E8F5E9"
                 else:
                     cell_border, cell_bg = "#E0E0E0", "#FFFFFF"
 
-                # 頂層日期選擇按鈕
-                if st.button(f"{day_label} ({weekday_label})", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
-                    st.session_state["dashboard_selected_date"] = dt
-                    st.rerun()
+                # 頂層日期選擇按鈕（假日時套用粉紅色強調樣式）
+                if holiday_name:
+                    st.markdown(
+                        f"""
+                        <div style="background-color:#FFEBEE; border-radius:8px; padding:4px 8px; margin-bottom:4px;">
+                            <span style="color:#C62828; font-weight:bold; font-size:0.95rem;">{day_label}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    if st.button(f"{day_label} ({weekday_label})", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
+                        st.session_state["dashboard_selected_date"] = dt
+                        st.rerun()
 
                 # 超額紅色警示
                 _over_areas = []
@@ -1981,6 +2015,10 @@ def render_dashboard_view():
                     badges_list.append(f'<div style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</div>')
 
                 tag_list = []
+                if holiday_name:
+                    tag_list.append(f'<span style="background:#E91E63; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.72rem; font-weight:700;">🎉 {holiday_name}</span>')
+                if is_makeup_workday:
+                    tag_list.append('<span style="background:#795548; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.72rem; font-weight:700;">💼 補班</span>')
                 if has_group:
                     tag_list.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span>')
                 if has_night_rush:
