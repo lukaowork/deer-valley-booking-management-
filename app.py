@@ -1537,6 +1537,110 @@ def render_delete_confirm_modal():
         st.rerun()
 
 
+def render_booking_card(row: pd.Series, key_prefix: str = "card") -> None:
+    """統一訂單卡片渲染（主清單與抽屜共用，確保佈局 100% 一致）
+
+    所有元素（header、詳情、備註、操作按鈕）嚴格在 st.container(border=True) 內。
+    """
+    booking_id = int(row["id"])
+    tag_style = TAG_BADGE_STYLE.get(row["tag"], TAG_BADGE_STYLE["一般"])
+    area_unit = CAMP_AREAS.get(row["area"], {}).get("unit", "帳")
+    rush_num = int(row.get("night_rush_quantity", 1 if row.get("night_rush") else 0))
+    has_rush_flag = (row.get("night_rush") == 1 or rush_num > 0)
+    is_group_shelter = is_shelter_group_booking(row.get("area", ""), row.get("quantity", 0))
+
+    with st.container(border=True):
+        # Header Row：客戶姓名/電話/標籤 + 右側金額
+        h_col1, h_col2 = st.columns([3, 1])
+        with h_col1:
+            st.markdown(
+                f"""
+                <div style="font-size:1.15rem; font-weight:800; color:#1B5E20;">{row['name']}</div>
+                <div style="margin-top:4px; font-size:0.9rem; color:#666;">
+                    📞 {row['phone']}
+                    <span style="{tag_style}; margin-left:8px;">{row['tag']}</span>
+                    {'<span style=\'background:#FFF8E1; color:#F57F17; border:1px solid #FFE082; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem; margin-left:6px;\'>🏷️ 雨棚包區</span>' if is_group_shelter else ''}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        with h_col2:
+            st.markdown(
+                f"""
+                <div style="text-align:right; font-size:1.2rem; font-weight:800; color:#D32F2F;">
+                    NT$ {int(row['total_amount']):,}
+                </div>
+                <div style="text-align:right; margin-top:4px; font-size:0.78rem; color:#757575;">
+                    第 {row['visit_count']} 次到訪
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("<hr style='margin:8px 0;'>", unsafe_allow_html=True)
+
+        # 區域行
+        st.markdown(
+            f"🏕️ <b>預約區域</b>：{row['area']} {'<span style=\'color:#F57F17; font-size:0.8rem;\'>(滿 6 帳包區)</span>' if is_group_shelter else ''}",
+            unsafe_allow_html=True,
+        )
+
+        # 日期行（含住宿晚數）
+        nights_count = 0
+        try:
+            _in_dt = datetime.strptime(str(row['check_in_date'])[:10], "%Y-%m-%d").date()
+            _out_dt = datetime.strptime(str(row['check_out_date'])[:10], "%Y-%m-%d").date()
+            nights_count = max(0, (_out_dt - _in_dt).days)
+        except (TypeError, ValueError):
+            pass
+        st.markdown(
+            f"📅 <b>入住~退房</b>：{row['check_in_date']} 至 {row['check_out_date']}（{nights_count} 晚）",
+            unsafe_allow_html=True,
+        )
+
+        # 夜衝行
+        st.markdown(
+            f"⚡ <b>夜衝</b>：{f'是 ({rush_num} {area_unit})' if has_rush_flag else '否'}",
+            unsafe_allow_html=True,
+        )
+
+        # 備註區塊（柔和樣式）
+        if row["notes"]:
+            st.markdown(
+                f"""
+                <div style="background-color:#FFFDE7; border-left:3px solid #FBC02D; padding:6px 12px; margin-top:6px; border-radius:4px; font-size:0.9rem; color:#5D4037;">
+                    📝 備註：{row['notes']}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        # 底部操作區：中繼資料 + 編輯/刪除按鈕（整合於卡片底部）
+        f_col1, f_col2, f_col3 = st.columns([3, 1, 1])
+        with f_col1:
+            st.markdown(
+                f"<div style='font-size:0.8rem; color:#757575; padding-top:6px;'>📌 訂單號: {row['booking_code']} ｜ 👤 經手人: {row['created_by']}</div>",
+                unsafe_allow_html=True,
+            )
+        with f_col2:
+            st.button(
+                "✏️ 編輯",
+                key=f"{key_prefix}_edit_{booking_id}",
+                use_container_width=True,
+                on_click=trigger_edit_booking,
+                args=(booking_id, dict(row)),
+            )
+        with f_col3:
+            st.button(
+                "🗑️ 刪除",
+                key=f"{key_prefix}_del_{booking_id}",
+                use_container_width=True,
+                type="secondary",
+                on_click=trigger_delete_dialog,
+                args=(booking_id, dict(row)),
+            )
+
+
 def render_card_edit_delete_controls(row: pd.Series) -> None:
     """訂單卡片內嵌的編輯/刪除按鈕 (on_click 綁定)"""
     btn_c1, btn_c2 = st.columns([1, 1])
@@ -1785,40 +1889,8 @@ def render_dashboard_view():
             if room_qty > 0:
                 area_dot_badges += f' <span style="background:#F3E5F5; color:#6A1B9A; border:1px solid #CE93D8; padding:2px 8px; border-radius:12px; font-weight:700; font-size:0.82rem;">🟣 通鋪 x{room_qty}</span>'
             
-            card_html = (
-                f"""
-                <div class="luye-card" style="{'border-left: 5px solid #FBC02D;' if is_group_shelter else ''} margin-bottom:12px;">
-                    <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <div>
-                            <span style="font-size:1.2rem; font-weight:700; color:#1B5E20;">{row['name']}</span>
-                            <span style="font-size:0.95rem; color:#666; margin-left:12px;">📞 {row['phone']}</span>
-                            <span style="{tag_style}; margin-left:10px;">{row['tag']}</span>
-                            {area_dot_badges}
-                            {shelter_group_badge}
-                        </div>
-                        <div>
-                            <span style="font-weight:700; font-size:1.25rem; color:#E65100;">NT$ {int(row['total_amount']):,}</span>
-                        </div>
-                    </div>
-                    <div style="margin-top:10px; font-size:0.92rem; color:#333; display:flex; flex-wrap:wrap; gap:16px;">
-                        <div>🏕️ <b>區域</b>：{row['area']} {'(滿 6 帳包區)' if is_group_shelter else ''}</div>
-                        <div>📅 <b>入住~退房</b>：{row['check_in_date']} 至 {row['check_out_date']}</div>
-                        <div>⚡ <b>夜衝</b>：{f'是 ({rush_num} {area_unit})' if has_rush_flag else '否'}</div>
-                        <div>🔖 <b>訂單號</b>：<code>{row['booking_code']}</code></div>
-                    </div>
-                    {f'<div style="margin-top:8px; padding:6px 10px; background:#FFF9C4; border-radius:6px; font-size:0.88rem; color:#5D4037;">📝 備註：{row["notes"]}</div>' if row["notes"] else ''}
-                </div>
-                """
-            )
-            
-            if hasattr(st, "html"):
-                st.html(card_html)
-            else:
-                st.markdown(card_html, unsafe_allow_html=True)
-
-            # 卡片內嵌編輯/刪除控件 (session_state 驅動，
-            # 表單與確認直接渲染於卡片下方)
-            render_card_edit_delete_controls(row)
+            # 統一訂單卡片（呼叫 helper，與主清單視圖完全一致）
+            render_booking_card(row, key_prefix="drawer")
 
 
 # ==============================================================================
@@ -1978,98 +2050,8 @@ def render_bookings_view():
                     else ""
                 )
 
-                # 統一卡片容器（含邊框），所有元素盡在容器內
-                card_box = st.container(border=True)
-                with card_box:
-                    # Header Row：客戶姓名/電話/標籤 + 右側金額
-                    h_col1, h_col2 = st.columns([3, 1])
-                    with h_col1:
-                        st.markdown(
-                            f"""
-                            <div style="font-size:1.15rem; font-weight:800; color:#1B5E20;">{row['name']}</div>
-                            <div style="margin-top:4px; font-size:0.9rem; color:#666;">
-                                📞 {row['phone']}
-                                <span style="{tag_style}; margin-left:8px;">{row['tag']}</span>
-                                {shelter_group_badge}
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-                    with h_col2:
-                        st.markdown(
-                            f"""
-                            <div style="text-align:right; font-size:1.2rem; font-weight:800; color:#D32F2F;">
-                                NT$ {row['total_amount']:,}
-                            </div>
-                            <div style="text-align:right; margin-top:4px; font-size:0.78rem; color:#757575;">
-                                第 {row['visit_count']} 次到訪
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                    st.markdown("<hr style='margin:8px 0;'>", unsafe_allow_html=True)
-
-                    # 區域行
-                    st.markdown(
-                        f"🏕️ <b>預約區域</b>：{row['area']} {'<span style=\'color:#F57F17; font-size:0.8rem;\'>(滿 6 帳包區)</span>' if is_group_shelter else ''}",
-                        unsafe_allow_html=True,
-                    )
-
-                    # 日期行（含住宿晚數）
-                    nights_count = 0
-                    try:
-                        _in_dt = datetime.strptime(str(row['check_in_date'])[:10], "%Y-%m-%d").date()
-                        _out_dt = datetime.strptime(str(row['check_out_date'])[:10], "%Y-%m-%d").date()
-                        nights_count = max(0, (_out_dt - _in_dt).days)
-                    except (TypeError, ValueError):
-                        pass
-                    st.markdown(
-                        f"📅 <b>入住~退房</b>：{row['check_in_date']} 至 {row['check_out_date']}（{nights_count} 晚）",
-                        unsafe_allow_html=True,
-                    )
-
-                    # 夜衝行
-                    st.markdown(
-                        f"⚡ <b>夜衝</b>：{f'是 ({rush_num} {area_unit})' if has_rush_flag else '否'}",
-                        unsafe_allow_html=True,
-                    )
-
-                    # 備註區塊（柔和樣式）
-                    if row["notes"]:
-                        st.markdown(
-                            f"""
-                            <div style="background-color:#FFFDE7; border-left:3px solid #FBC02D; padding:6px 12px; margin-top:6px; border-radius:4px; font-size:0.9rem; color:#5D4037;">
-                                📝 備註：{row['notes']}
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                    # 底部操作區：中繼資料 + 編輯/刪除按鈕（整合於卡片底部）
-                    b_col1, b_col2, b_col3 = st.columns([3, 1, 1])
-                    with b_col1:
-                        st.markdown(
-                            f"<div style='font-size:0.8rem; color:#757575; padding-top:6px;'>📌 訂單號: {row['booking_code']} ｜ 👤 經手人: {row['created_by']}</div>",
-                            unsafe_allow_html=True,
-                        )
-                    with b_col2:
-                        st.button(
-                            "✏️ 編輯",
-                            key=f"card_edit_{row['id']}",
-                            use_container_width=True,
-                            on_click=trigger_edit_booking,
-                            args=(row["id"], dict(row)),
-                        )
-                    with b_col3:
-                        st.button(
-                            "🗑️ 刪除",
-                            key=f"card_del_{row['id']}",
-                            use_container_width=True,
-                            type="secondary",
-                            on_click=trigger_delete_dialog,
-                            args=(row["id"], dict(row)),
-                        )
+                # 統一訂單卡片（呼叫 helper，與抽屜視圖完全一致）
+                render_booking_card(row, key_prefix="card")
 
         else:
             st.info("尚無符合搜尋條件的訂單記錄。")
