@@ -1688,52 +1688,51 @@ def render_dashboard_view():
                         if rush_qty > 0:
                             has_night_rush = True
                 
-                # 格子容器：單一自包含 HTML 卡片，所有徽章盡在容器內
+                # 格子樣式：根據選取/今日/一般狀態決定邊框與背景色
                 if is_selected:
-                    cell_border, cell_bg = "#1565C0", "#E3F2FD"
+                    border_color, bg_color = "#1565C0", "#E3F2FD"
                 elif is_today:
-                    cell_border, cell_bg = "#2E7D32", "#E8F5E9"
+                    border_color, bg_color = "#2E7D32", "#E8F5E9"
                 else:
-                    cell_border, cell_bg = "#E0E0E0", "#FFFFFF"
+                    border_color, bg_color = "#E0E0E0", "#FFFFFF"
 
                 # 區域摘要徽章 (compact font, font-weight 600)
-                badges = []
+                badges_html = ""
                 if summary["雨棚區"] > 0:
-                    badges.append(f'<span style="font-size:0.85rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</span>')
+                    badges_html += f'<div style="font-size:0.85rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</div>'
                 if summary["草地區"] > 0:
-                    badges.append(f'<span style="font-size:0.85rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</span>')
+                    badges_html += f'<div style="font-size:0.85rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</div>'
                 if summary["通舖房間"] > 0:
-                    badges.append(f'<span style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</span>')
+                    badges_html += f'<div style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</div>'
 
                 # 特徵膠囊標籤 (soft padding, inline pills)
-                tags = []
+                tags_html = ""
                 if has_group:
-                    tags.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 8px; border-radius:999px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span>')
+                    tags_html += '<span style="background:#F57F17; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span> '
                 if has_night_rush:
-                    tags.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 8px; border-radius:999px; font-size:0.75rem; font-weight:700;">⚡ 夜衝</span>')
+                    tags_html += '<span style="background:#E65100; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">⚡ 夜衝</span>'
 
-                # 組合所有徽章 (區域摘要 + 特徵標籤)
-                status_items = badges + tags
-                status_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; align-items:center; margin-top:4px; min-height:20px;">{"".join(status_items)}</div>' if status_items else '<div style="min-height:20px;"></div>'
+                # 單一完整 HTML 卡片：Header + Badges + Tags 全部封裝在單一 div 內
+                card_html = f"""
+                <div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 10px; padding: 10px; min-height: 125px; box-shadow: 0 2px 4px rgba(0,0,0,0.03);">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                        <span style="font-size: 1.1rem; font-weight: 800; color: #212121;">{day_label}</span>
+                        <span style="font-size: 0.8rem; color: #757575;">{weekday_label}</span>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px;">
+                        {badges_html}
+                    </div>
+                    <div style="display: flex; gap: 4px; flex-wrap: wrap;">
+                        {tags_html}
+                    </div>
+                </div>
+                """
+                st.markdown(card_html, unsafe_allow_html=True)
 
-                # 卡片容器開頭：圓角微邊框 + 內襯 + 當日/選取日高亮
-                st.markdown(
-                    f'<div style="border:1px solid {cell_border}; border-radius:8px; padding:8px; '
-                    f'background:{cell_bg}; display:flex; flex-direction:column; gap:4px; min-height:120px;">'
-                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
-                    f'<span style="font-size:0.9rem; opacity:0.8; font-weight:700; color:#424242;">{day_label}</span>'
-                    f'<span style="font-size:0.85rem; opacity:0.8; color:#757575;">{weekday_label}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                # 日期按鈕 (整合於卡片內，use_container_width 確保全寬)
-                if st.button(day_label, key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
+                # 獨立選擇按鈕（置於卡片下方，避免 Streamlit 關閉 div 導致徽章溢出）
+                if st.button("選擇", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type="primary" if is_selected else "secondary"):
                     st.session_state["dashboard_selected_date"] = dt
                     st.rerun()
-
-                # 徽章內容 + 關閉卡片容器 (所有徽章盡在卡片 div 內)
-                st.markdown(f'{status_html}</div>', unsafe_allow_html=True)
 
     # 3. 日期點擊與側邊/下方「訂單資料抽屜 (Drawer)」
     selected_dt = st.session_state["dashboard_selected_date"]
