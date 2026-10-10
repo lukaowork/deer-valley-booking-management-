@@ -1692,73 +1692,55 @@ def render_dashboard_view():
                 is_selected = (dt == st.session_state["dashboard_selected_date"])
                 is_today = (dt == date.today())
                 
-                # Determine background and border styling
-                if is_selected:
-                    border_color, bg_color = "#1565C0", "#E3F2FD"
-                elif is_today:
-                    border_color, bg_color = "#2E7D32", "#E8F5E9"
-                else:
-                    border_color, bg_color = "#E0E0E0", "#FFFFFF"
-
+                # 日期標籤
                 day_label = f"{dt.month}/{dt.day}" if dt.day == 1 else f"{dt.day}"
                 weekday_label = day_names[dt.weekday()]
+                btn_type = "primary" if is_selected else "secondary"
 
-                # Calculate booking statistics for this day
-                mask = (pd.to_datetime(df_all["check_in_date"]).dt.date <= dt) & (pd.to_datetime(df_all["check_out_date"]).dt.date > dt)
-                daily_df = df_all[mask]
+                # 格子樣式 (選取/今日/一般)
+                if is_selected:
+                    cell_border, cell_bg = "#1565C0", "#E3F2FD"
+                elif is_today:
+                    cell_border, cell_bg = "#2E7D32", "#E8F5E9"
+                else:
+                    cell_border, cell_bg = "#E0E0E0", "#FFFFFF"
 
-                summary = {"雨棚區": 0, "草地區": 0, "通舖房間": 0}
-                has_group = False
-                has_night_rush = False
+                # 卡片容器開頭：統一 min-height 確保網格對齊
+                st.markdown(
+                    f'<div style="border:1px solid {cell_border}; border-radius:8px; padding:8px; '
+                    f'background:{cell_bg}; display:flex; flex-direction:column; gap:4px; min-height:135px;">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                    f'<span style="font-size:0.8rem; color:#757575;">{weekday_label}</span>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
-                for _, row in daily_df.iterrows():
-                    area = row["area"]
-                    qty = int(row["quantity"])
-                    parsed_areas = parse_area_quantities(str(area), qty)
-                    for area_name, area_qty in parsed_areas.items():
-                        if area_name in summary:
-                            summary[area_name] += area_qty
-                    if is_shelter_group_booking(area, qty):
-                        has_group = True
-                    if str(row["check_in_date"]) == dt.strftime("%Y-%m-%d"):
-                        rush_qty = int(row.get("night_rush_quantity", 1 if row.get("night_rush") else 0))
-                        if rush_qty > 0:
-                            has_night_rush = True
-
-                # Build inner HTML badges
-                badges_list = []
-                if summary["雨棚區"] > 0:
-                    badges_list.append(f'<div style="font-size:0.85rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</div>')
-                if summary["草地區"] > 0:
-                    badges_list.append(f'<div style="font-size:0.85rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</div>')
-                if summary["通舖房間"] > 0:
-                    badges_list.append(f'<div style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</div>')
-
-                if has_group:
-                    badges_list.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span>')
-                if has_night_rush:
-                    badges_list.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">⚡ 夜衝</span>')
-
-                inner_content = "".join(badges_list) if badges_list else '<div style="color:#BDBDBD; font-size:0.8rem;">(空帳)</div>'
-
-                # Complete single-card HTML block
-                card_html = f'''
-                <div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 10px; padding: 10px; min-height: 110px; box-shadow: 0 2px 4px rgba(0,0,0,0.03); margin-bottom: 6px;">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
-                        <span style="font-size: 1.1rem; font-weight: 800; color: #212121;">{day_label}</span>
-                        <span style="font-size: 0.8rem; color: #757575;">{weekday_label}</span>
-                    </div>
-                    <div style="display: flex; flex-direction: column; gap: 4px;">
-                        {inner_content}
-                    </div>
-                </div>
-                '''
-
-                st.markdown(card_html, unsafe_allow_html=True)
-
-                if st.button("選擇", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type="primary" if is_selected else "secondary"):
+                # 日期數字本身即為選擇按鈕 (移除獨立「選擇」按鈕)
+                if st.button(day_label, key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
                     st.session_state["dashboard_selected_date"] = dt
                     st.rerun()
+
+                # 緊湊徽章 (區域摘要 + 特徵膠囊，flex-wrap 避免溢出)
+                badges_list = []
+                if summary["雨棚區"] > 0:
+                    badges_list.append(f'<span style="font-size:0.85rem; color:#1B5E20; font-weight:600; white-space:nowrap;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</span>')
+                if summary["草地區"] > 0:
+                    badges_list.append(f'<span style="font-size:0.85rem; color:#E65100; font-weight:600; white-space:nowrap;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</span>')
+                if summary["通舖房間"] > 0:
+                    badges_list.append(f'<span style="font-size:0.85rem; color:#6A1B9A; font-weight:600; white-space:nowrap;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</span>')
+
+                if has_group:
+                    badges_list.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.72rem; font-weight:700;">🏷️ 包區</span>')
+                if has_night_rush:
+                    badges_list.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.72rem; font-weight:700;">⚡ 夜衝</span>')
+
+                if badges_list:
+                    badges_html = f'<div style="display:flex; gap:4px; flex-wrap:wrap; align-items:center;">{"".join(badges_list)}</div>'
+                else:
+                    badges_html = '<div style="color:#BDBDBD; font-size:0.8rem;">(空帳)</div>'
+
+                # 徽章內容 + 關閉卡片容器
+                st.markdown(f'{badges_html}</div>', unsafe_allow_html=True)
 
     # 3. 日期點擊與側邊/下方「訂單資料抽屜 (Drawer)」
     selected_dt = st.session_state["dashboard_selected_date"]
