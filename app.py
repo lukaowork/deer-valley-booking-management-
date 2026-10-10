@@ -1688,7 +1688,11 @@ def render_dashboard_view():
                         if rush_qty > 0:
                             has_night_rush = True
                 
-                # 格子樣式：根據選取/今日/一般狀態決定邊框與背景色
+            with w_cols[i]:
+                is_selected = (dt == st.session_state["dashboard_selected_date"])
+                is_today = (dt == date.today())
+                
+                # Determine background and border styling
                 if is_selected:
                     border_color, bg_color = "#1565C0", "#E3F2FD"
                 elif is_today:
@@ -1696,40 +1700,62 @@ def render_dashboard_view():
                 else:
                     border_color, bg_color = "#E0E0E0", "#FFFFFF"
 
-                # 區域摘要徽章 (compact font, font-weight 600)
-                badges_html = ""
+                day_label = f"{dt.month}/{dt.day}" if dt.day == 1 else f"{dt.day}"
+                weekday_label = day_names[dt.weekday()]
+
+                # Calculate booking statistics for this day
+                mask = (pd.to_datetime(df_all["check_in_date"]).dt.date <= dt) & (pd.to_datetime(df_all["check_out_date"]).dt.date > dt)
+                daily_df = df_all[mask]
+
+                summary = {"雨棚區": 0, "草地區": 0, "通舖房間": 0}
+                has_group = False
+                has_night_rush = False
+
+                for _, row in daily_df.iterrows():
+                    area = row["area"]
+                    qty = int(row["quantity"])
+                    parsed_areas = parse_area_quantities(str(area), qty)
+                    for area_name, area_qty in parsed_areas.items():
+                        if area_name in summary:
+                            summary[area_name] += area_qty
+                    if is_shelter_group_booking(area, qty):
+                        has_group = True
+                    if str(row["check_in_date"]) == dt.strftime("%Y-%m-%d"):
+                        rush_qty = int(row.get("night_rush_quantity", 1 if row.get("night_rush") else 0))
+                        if rush_qty > 0:
+                            has_night_rush = True
+
+                # Build inner HTML badges
+                badges_list = []
                 if summary["雨棚區"] > 0:
-                    badges_html += f'<div style="font-size:0.85rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</div>'
+                    badges_list.append(f'<div style="font-size:0.85rem; color:#1B5E20; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#2E7D32; margin-right:4px;"></span>雨棚 x{summary["雨棚區"]}</div>')
                 if summary["草地區"] > 0:
-                    badges_html += f'<div style="font-size:0.85rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</div>'
+                    badges_list.append(f'<div style="font-size:0.85rem; color:#E65100; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#EF6C00; margin-right:4px;"></span>草地 x{summary["草地區"]}</div>')
                 if summary["通舖房間"] > 0:
-                    badges_html += f'<div style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</div>'
+                    badges_list.append(f'<div style="font-size:0.85rem; color:#6A1B9A; font-weight:600;"><span style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#8E24AA; margin-right:4px;"></span>通鋪 x{summary["通舖房間"]}</div>')
 
-                # 特徵膠囊標籤 (soft padding, inline pills)
-                tags_html = ""
                 if has_group:
-                    tags_html += '<span style="background:#F57F17; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span> '
+                    badges_list.append('<span style="background:#F57F17; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">🏷️ 包區</span>')
                 if has_night_rush:
-                    tags_html += '<span style="background:#E65100; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">⚡ 夜衝</span>'
+                    badges_list.append('<span style="background:#E65100; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.75rem; font-weight:700;">⚡ 夜衝</span>')
 
-                # 單一完整 HTML 卡片：Header + Badges + Tags 全部封裝在單一 div 內
-                card_html = f"""
-                <div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 10px; padding: 10px; min-height: 125px; box-shadow: 0 2px 4px rgba(0,0,0,0.03);">
+                inner_content = "".join(badges_list) if badges_list else '<div style="color:#BDBDBD; font-size:0.8rem;">(空帳)</div>'
+
+                # Complete single-card HTML block
+                card_html = f'''
+                <div style="border: 2px solid {border_color}; background-color: {bg_color}; border-radius: 10px; padding: 10px; min-height: 110px; box-shadow: 0 2px 4px rgba(0,0,0,0.03); margin-bottom: 6px;">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
                         <span style="font-size: 1.1rem; font-weight: 800; color: #212121;">{day_label}</span>
                         <span style="font-size: 0.8rem; color: #757575;">{weekday_label}</span>
                     </div>
-                    <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 6px;">
-                        {badges_html}
-                    </div>
-                    <div style="display: flex; gap: 4px; flex-wrap: wrap;">
-                        {tags_html}
+                    <div style="display: flex; flex-direction: column; gap: 4px;">
+                        {inner_content}
                     </div>
                 </div>
-                """
+                '''
+
                 st.markdown(card_html, unsafe_allow_html=True)
 
-                # 獨立選擇按鈕（置於卡片下方，避免 Streamlit 關閉 div 導致徽章溢出）
                 if st.button("選擇", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type="primary" if is_selected else "secondary"):
                     st.session_state["dashboard_selected_date"] = dt
                     st.rerun()
