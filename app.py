@@ -279,6 +279,142 @@ def get_audit_logs(limit: int = 200) -> pd.DataFrame:
 # ==============================================================================
 # 3. 費用計算、週末連動與訂單邏輯輔助函式
 # ==============================================================================
+def check_booking_capacity(
+    check_in: date,
+    check_out: date,
+    requested_qty: Dict[str, int],
+    exclude_booking_id: Optional[int] = None,
+) -> Tuple[bool, str, Dict[str, Any]]:
+    """驗證指定日期區間各區域容量是否超額（純函式）
+
+    回傳 (is_overbooked, message, details)：
+    - is_overbooked: 任一天任一區域超過上限即為 True
+    - message: 供 UI 顯示的警示訊息
+    - details: 各區域每日最大已訂數量與容量上限
+    """
+    is_overbooked = False
+    details: Dict[str, Any] = {"daily": {}, "requested": requested_qty}
+
+    # 建立日期區間 [check_in, check_out) 的每日清單
+    delta_days = (check_out - check_in).days
+    if delta_days <= 0:
+        delta_days = 1
+    date_list = [check_in + timedelta(days=i) for i in range(delta_days)]
+
+    max_occupied = {"雨棚區": 0, "草地區": 0, "通舖房間": 0}
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for area_name in ("雨棚區", "草地區", "通舖房間"):
+            cap = CAMP_AREAS[area_name]["capacity"]
+            for d in date_list:
+                d_str = d.strftime("%Y-%m-%d")
+                # 查詢該日該區域總預訂數量（排除目前編輯的訂單）
+                if exclude_booking_id is not None:
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(SUM(quantity), 0) FROM bookings
+                        WHERE ? >= check_in_date AND ? < check_out_date
+                          AND area LIKE ? AND id != ?
+                        """,
+                        (d_str, d_str, f"%{area_name}%", exclude_booking_id),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(SUM(quantity), 0) FROM bookings
+                        WHERE ? >= check_in_date AND ? < check_out_date
+                          AND area LIKE ?
+                        """,
+                        (d_str, d_str, f"%{area_name}%"),
+                    )
+                occupied = int(cursor.fetchone()[0])
+                # 加上新預訂數量
+                total = occupied + requested_qty.get(area_name, 0)
+                details["daily"].setdefault(d_str, {})[area_name] = {
+                    "occupied": occupied,
+                    "requested": requested_qty.get(area_name, 0),
+                    "total": total,
+                    "capacity": cap,
+                }
+                max_occupied[area_name] = max(max_occupied[area_name], total)
+                if total > cap:
+                    is_overbooked = True
+        conn.close()
+    except Exception as e:
+        return True, f"⚠️ 容量驗證失敗：{e}", details
+
+    details["max_occupied"] = max_occupied
+
+    if is_overbooked:
+        # 找出超額的區域與日期
+        over_msgs = []
+        for d_str, areas in details["daily"].items():
+            for area_name, info in areas.items():
+                if info["total"] > info["capacity"]:
+                    over_msgs.append(f"{d_str} {area_name} 已訂 {info['occupied']} 帳，新增 {info['requested']} 帳將達 {info['total']} 帳（上限 {info['capacity']} 帳）")
+        message = "⚠️ 警告：" + "；".join(over_msgs) + "，已爆單超額！"
+        return True, message, details
+
+    # 未超額：顯示目前區間最高已訂數量
+    peak_msgs = []
+    for area_name in ("雨棚區", "草地區", "通舖房間"):
+        if requested_qty.get(area_name, 0) > 0:
+            peak = max_occupied[area_name] - requested_qty[area_name]
+            cap = CAMP_AREAS[area_name]["capacity"]
+            peak_msgs.append(f"{area_name}最高已訂 {peak} 帳，剩餘 {cap - peak} 帳")
+    message = "✅ 目前區間" + "；".join(peak_msgs) if peak_msgs else "✅ 目前區間無預訂"
+    return False, message, details
+
+
+def check_shelter_group_eligibility(
+    check_in: date,
+    check_out: date,
+    shelter_qty: int,
+    exclude_booking_id: Optional[int] = None,
+) -> bool:
+    """判斷是否符合雨棚區包區資格（純函式）
+
+    資格：雨棚預訂 >= 6 帳，且該日期區間內無任何散客雨棚預約。
+    """
+    if shelter_qty < 6:
+        return False
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        delta_days = (check_out - check_in).days
+        if delta_days <= 0:
+            delta_days = 1
+        for i in range(delta_days):
+            d_str = (check_in + timedelta(days=i)).strftime("%Y-%m-%d")
+            if exclude_booking_id is not None:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM bookings
+                    WHERE ? >= check_in_date AND ? < check_out_date
+                      AND area LIKE '%雨棚區%' AND id != ?
+                    """,
+                    (d_str, d_str, exclude_booking_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM bookings
+                    WHERE ? >= check_in_date AND ? < check_out_date
+                      AND area LIKE '%雨棚區%'
+                    """,
+                    (d_str, d_str),
+                )
+            count = int(cursor.fetchone()[0])
+            conn.close()
+            if count > 0:
+                return False
+    except Exception:
+        return False
+    return True
+
+
 def calculate_booking_fee(
     area: str, quantity: int, check_in: date, check_out: date, night_rush_qty_str: str = ""
 ) -> Tuple[int, int, int, int]:
