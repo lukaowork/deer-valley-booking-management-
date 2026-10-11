@@ -123,6 +123,20 @@ CAMP_AREAS: Dict[str, Dict[str, Any]] = {
     },
 }
 
+# 台灣國定假日靜態映射（純字典，零外部依賴）
+TW_HOLIDAYS = {
+    # 2026 國定假日
+    "2026-01-01": "元旦", "2026-02-16": "除夕", "2026-02-17": "初一",
+    "2026-02-18": "初二", "2026-02-19": "初三", "2026-02-20": "初四",
+    "2026-02-28": "和平紀念日", "2026-04-04": "兒童節", "2026-04-05": "清明節",
+    "2026-06-19": "端午節", "2026-09-25": "中秋節", "2026-10-10": "國慶日",
+    # 2027 國定假日
+    "2027-01-01": "元旦", "2027-02-05": "除夕", "2027-02-06": "初一",
+    "2027-02-07": "初二", "2027-02-08": "初三", "2027-02-28": "和平紀念日",
+    "2027-04-04": "兒童節", "2027-04-05": "清明節", "2027-06-09": "端午節",
+    "2027-09-15": "中秋節", "2027-10-10": "國慶日",
+}
+
 CUSTOMER_TAGS = ["一般", "好客人", "需要注意的客人"]
 
 TAG_BADGE_STYLE = {
@@ -1880,14 +1894,8 @@ def render_dashboard_view():
     # 2. 取出整批資料作快取計算與日曆網格渲染
     df_all = fetch_all_bookings_df()
 
-    # 初始化台灣國定假日查詢（含 fallback 機制）
-    try:
-        import holidays as _holidays_pkg
-        _current_year = st.session_state.get("dashboard_selected_date", date.today()).year
-        tw_holidays = _holidays_pkg.Taiwan(years=[_current_year, _current_year + 1])
-    except Exception:
-        # fallback: 常見國定假日靜態映射
-        tw_holidays = {}
+    # 台灣國定假日查詢（純字典，零外部依賴）
+    tw_holidays = TW_HOLIDAYS
 
     # 補班日判斷（週六且為補班日）
     _makeup_workdays = set()  # 可擴充為官方補班日清單
@@ -1952,15 +1960,9 @@ def render_dashboard_view():
                 weekday_label = day_names[dt.weekday()]
                 btn_type = "primary" if is_selected else "secondary"
 
-                # 台灣國定假日檢查
-                holiday_name = tw_holidays.get(dt) if tw_holidays else None
+                # 台灣國定假日檢查（僅用於格子樣式與卡片徽章，不影響按鈕可點擊性）
+                holiday_name = tw_holidays.get(dt.isoformat()) if tw_holidays else None
                 is_makeup_workday = dt.weekday() == 5 and dt in _makeup_workdays  # 週六補班
-
-                # 假日標籤附加
-                if holiday_name:
-                    day_label = f"{day_label} ({holiday_name})"
-                if is_makeup_workday:
-                    day_label = f"{day_label} 💼補班"
 
                 # 格子樣式 (選取/今日/一般/假日)
                 if holiday_name:
@@ -1972,20 +1974,10 @@ def render_dashboard_view():
                 else:
                     cell_border, cell_bg = "#E0E0E0", "#FFFFFF"
 
-                # 頂層日期選擇按鈕（假日時套用粉紅色強調樣式）
-                if holiday_name:
-                    st.markdown(
-                        f"""
-                        <div style="background-color:#FFEBEE; border-radius:8px; padding:4px 8px; margin-bottom:4px;">
-                            <span style="color:#C62828; font-weight:bold; font-size:0.95rem;">{day_label}</span>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    if st.button(f"{day_label} ({weekday_label})", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
-                        st.session_state["dashboard_selected_date"] = dt
-                        st.rerun()
+                # 頂層日期選擇按鈕（標準類型，維持完全可點擊）
+                if st.button(f"{day_label} ({weekday_label})", key=f"cal_btn_{dt.isoformat()}", use_container_width=True, type=btn_type):
+                    st.session_state["dashboard_selected_date"] = dt
+                    st.rerun()
 
                 # 超額紅色警示
                 _over_areas = []
@@ -2016,7 +2008,7 @@ def render_dashboard_view():
 
                 tag_list = []
                 if holiday_name:
-                    tag_list.append(f'<span style="background:#E91E63; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.72rem; font-weight:700;">🎉 {holiday_name}</span>')
+                    tag_list.append('<span style="background:#FFEBEE; color:#C62828; border:1px solid #FFCDD2; padding:2px 8px; border-radius:12px; font-size:0.75rem; font-weight:700;">🔴 國定假日</span>')
                 if is_makeup_workday:
                     tag_list.append('<span style="background:#795548; color:#FFFFFF; padding:2px 6px; border-radius:10px; font-size:0.72rem; font-weight:700;">💼 補班</span>')
                 if has_group:
