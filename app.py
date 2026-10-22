@@ -874,22 +874,25 @@ class GoogleDriveSync:
             from googleapiclient.discovery import build
 
             creds = None
-            # 優先嘗試 1: 本地 service_account.json
-            if os.path.exists(SERVICE_ACCOUNT_PATH):
-                creds = service_account.Credentials.from_service_account_file(
-                    SERVICE_ACCOUNT_PATH,
-                    scopes=["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"],
-                )
-                self.status_message = "已透過本地 service_account.json 認證"
-
-            # 嘗試 2: Streamlit secrets
-            elif hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+            # 優先嘗試 1: Streamlit Secrets (雲端部署，免重新上傳 JSON)
+            if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
                 creds_info = dict(st.secrets["gcp_service_account"])
+                # 私鑰字面 \n 還原為真實換行符
+                if isinstance(creds_info.get("private_key"), str):
+                    creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
                 creds = service_account.Credentials.from_service_account_info(
                     creds_info,
                     scopes=["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"],
                 )
                 self.status_message = "已透過 Streamlit Secrets 認證"
+
+            # 嘗試 2: 本地 service_account.json (僅供本地開發回退)
+            elif os.path.exists(SERVICE_ACCOUNT_PATH):
+                creds = service_account.Credentials.from_service_account_file(
+                    SERVICE_ACCOUNT_PATH,
+                    scopes=["https://www.googleapis.com/auth/drive.file", "https://www.googleapis.com/auth/drive"],
+                )
+                self.status_message = "已透過本地 service_account.json 認證"
 
             if creds:
                 self.service = build("drive", "v3", credentials=creds, cache_discovery=False)
@@ -1131,6 +1134,13 @@ def get_spreadsheet_id() -> str:
     return ""
 
 
+# Google Sheets API 權限範圍 (試算表讀寫 + Drive 權限)
+GSHEET_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+
 @st.cache_resource(show_spinner=False)
 def get_gspread_client():
     """建立 Google Sheets API 連線客戶端 (gspread) 並快取，避免每次重新認證
@@ -1142,23 +1152,26 @@ def get_gspread_client():
     import gspread
 
     creds = None
-    # 認證來源 1: Streamlit Secrets
+    # 認證來源 1 (優先)：Streamlit Secrets — 雲端部署免重新上傳 JSON 憑證
     if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
         try:
             creds_info = dict(st.secrets["gcp_service_account"])
+            # TOML 單行字串中的私鑰換行常以字面 \n 呈現，還原為真實換行符
+            if isinstance(creds_info.get("private_key"), str):
+                creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
             creds = service_account.Credentials.from_service_account_info(
                 creds_info,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                scopes=GSHEET_SCOPES,
             )
         except Exception as e:
             print(f"[Google Sheets] Secrets 認證失敗: {e}")
 
-    # 認證來源 2: 本機 service_account.json (本地開發環境)
+    # 認證來源 2 (回退)：本機 data/service_account.json — 僅供本地開發環境
     if creds is None and os.path.exists(SERVICE_ACCOUNT_PATH):
         try:
             creds = service_account.Credentials.from_service_account_file(
                 SERVICE_ACCOUNT_PATH,
-                scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                scopes=GSHEET_SCOPES,
             )
         except Exception as e:
             print(f"[Google Sheets] 本機憑證認證失敗: {e}")
@@ -1438,6 +1451,43 @@ def pull_google_sheet_to_db() -> Tuple[int, int]:
         st.warning(f"⚠️ Google Sheets 啟動拉取失敗，將以本機 SQLite 資料顯示：{e}")
         st.session_state["gsheet_startup_pull_done"] = True
         return 0, 0
+
+
+def hydrate_sqlite_from_sheets() -> int:
+    """啟動水合 (Hydration)：本機 SQLite bookings 表為空時，
+    從 Google Sheets 拉取全部歷史訂單自動還原。
+
+    用途：Streamlit Community Cloud 容器休眠 (hibernation) 或重啟會清空
+    暫存磁碟上的 SQLite 檔，此函式於應用啟動時立即檢查並從雲端復原，
+    確保資料不遺失；本機已有資料時不動作，避免雲端舊資料覆寫剛寫入
+    的更新。任何失敗僅記錄日誌與顯示警告，不中斷 UI 流程。
+    回傳實際還原的訂單筆數。
+    """
+    try:
+        conn = get_db_connection()
+        try:
+            count = int(conn.execute("SELECT COUNT(*) FROM bookings").fetchone()[0])
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"[Hydration] 檢查本機資料表失敗，略過水合: {e}")
+        return 0
+
+    if count > 0:
+        # 本機已有資料：無須水合，直接視為啟動拉取已完成
+        st.session_state["gsheet_startup_pull_done"] = True
+        return 0
+
+    print("[Hydration] 偵測到本機 SQLite 為空 (休眠重啟)，從 Google Sheets 還原...")
+    inserted, _skipped = pull_google_sheet_to_db()
+    # 無論拉取結果皆標記啟動拉取已完成 (真實 pull 內部亦會設定，此處雙保險)
+    st.session_state["gsheet_startup_pull_done"] = True
+    if inserted > 0:
+        try:
+            st.toast("✅ 已從 Google Sheets 還原本機資料庫", icon="🔄")
+        except Exception:
+            pass
+    return inserted
 
 
 def backup_database_to_google_sheets_full() -> Tuple[bool, str]:
@@ -3491,10 +3541,11 @@ def main():
     if deduplicate_bookings() > 0:
         st.cache_data.clear()
 
-    # 啟動拉取：僅於應用程式首次啟動時執行一次，
-    # 避免每次重跑皆從 Google Sheets 拉取舊資料覆寫剛寫入 SQLite 的更新
+    # 啟動水合 (Hydration)：容器休眠/重啟清空本機 SQLite 暫存磁碟時，
+    # 立即從 Google Sheets 還原全部歷史訂單；本機已有資料則不動作，
+    # 避免每次重跑皆從雲端拉取舊資料覆寫剛寫入 SQLite 的更新
     if not st.session_state.get("gsheet_startup_pull_done", False):
-        pull_google_sheet_to_db()
+        hydrate_sqlite_from_sheets()
         st.session_state["gsheet_startup_pull_done"] = True
 
     # 同步完成後重新查詢全量訂單並寫入 session_state，
