@@ -528,6 +528,74 @@ def parse_area_quantities(area_str: str, total_qty: int = 1) -> Dict[str, int]:
     return res
 
 
+def parse_zone_string(area_raw: str) -> Tuple[str, Dict[str, int]]:
+    """解析預約區域字串（支援括號數量、多區段分隔與關鍵字變體）
+
+    - 多區段以「、」「,」「，」分隔，各段可含 (X 帳)/(Y 間) 括號數量
+    - 以關鍵字匹配（草地/雨棚/通舖/房間）取代嚴格相等，正規化為 CAMP_AREAS 正式名稱
+    - 回傳 (存入資料庫的完整區域字串, 各區域數量字典)
+      例: "雨棚區 (8 帳)、草地區 (4 帳)" -> (原字串, {"雨棚區": 8, "草地區": 4})
+          "通舖 (2 間)" -> ("通舖房間 (2 間)", {"通舖房間": 2})
+    """
+    import re
+    raw = str(area_raw).strip()
+    if not raw or raw.lower() in ("nan", "none", "null", "nat"):
+        return "雨棚區", {}
+
+    # 依具體度排序：正式名稱優先，避免「通舖房間」內的「房間」搶先命中
+    canonical_zones = ("雨棚區", "草地區", "通舖房間")
+    variant_map = [
+        ("雨棚", "雨棚區"),
+        ("草地", "草地區"),
+        ("通舖", "通舖房間"),
+        ("通鋪", "通舖房間"),
+        ("房間", "通舖房間"),
+    ]
+
+    def _match_zone(text: str) -> Optional[str]:
+        for name in canonical_zones:
+            if name in text:
+                return name
+        for keyword, canonical in variant_map:
+            if keyword in text:
+                return canonical
+        return None
+
+    parts = re.split(r"[、,，]", raw)
+    zone_counts: Dict[str, int] = {}
+    rebuilt_parts: List[str] = []
+    matched_any = False
+
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        zone = _match_zone(part)
+        if zone is None:
+            rebuilt_parts.append(part)  # 未識別片段原樣保留，不強制歸入雨棚區
+            continue
+        matched_any = True
+        # 抽取括號數量 (X 帳)/(Y 間)
+        count_match = re.search(r"[（(]\s*(\d+)[^)）]*[)）]", part)
+        if count_match:
+            zone_counts[zone] = zone_counts.get(zone, 0) + int(count_match.group(1))
+        if zone in part:
+            rebuilt_parts.append(part)  # 已是正式名稱，原樣保留完整描述
+        else:
+            # 關鍵字變體 (通舖/通鋪/草地/雨棚/房間) 以正式名稱取代後保留其餘文字
+            for keyword, canonical in variant_map:
+                if keyword in part:
+                    part = part.replace(keyword, canonical, 1)
+                    break
+            rebuilt_parts.append(part)
+
+    if not matched_any:
+        # 所有片段皆無區域關鍵字 -> 檢查完畢後才退回預設雨棚區
+        return "雨棚區", {}
+
+    return "、".join(rebuilt_parts), zone_counts
+
+
 def is_shelter_group_booking(area: str, quantity: int) -> bool:
     """判斷是否為雨棚區包區 (雨棚區且預約數量 >= 6)"""
     parsed = parse_area_quantities(str(area), int(quantity))
@@ -3014,10 +3082,12 @@ def render_import_export_view():
                             raw_phone = row.get(phone_col) if phone_col else row.get("露營人電話", row.get("phone", row.get("電話", "")))
                             phone = format_phone_number(raw_phone)
 
-                            # 預約區域解析
-                            area = str(row.get("預約區域", row.get("area", "雨棚區"))).strip()
-                            if area not in CAMP_AREAS:
-                                area = "雨棚區"
+                            # 預約區域解析 (支援括號數量與多區段複合字串)
+                            # 以關鍵字動態匹配取代嚴格相等，完整原始描述存入 area 欄位
+                            area_raw = str(row.get("預約區域", row.get("area", "雨棚區"))).strip()
+                            if area_raw.lower() in ["nan", "none", "null", "nat", ""]:
+                                area_raw = "雨棚區"
+                            area, zone_counts = parse_zone_string(area_raw)
 
                             # 日期安全解析 (確保絕不丟出 ValueError，允許無日期)
                             in_raw = str(row.get(in_col, "") if in_col else row.get("主要入住日期", row.get("check_in_date", ""))).strip()
@@ -3048,13 +3118,16 @@ def render_import_export_view():
                                     check_out_dt = check_in_dt + timedelta(days=1)
                                     check_out_str = check_out_dt.strftime("%Y-%m-%d")
 
-                            # 數量解析
+                            # 數量解析：優先採用區域字串括號內數量總和
+                            # (如 "雨棚區 (8 帳)、草地區 (4 帳)" -> 12)，否則取獨立數量欄位
                             raw_qty = row.get("帳數/間數", row.get("quantity", 1))
                             try:
-                                qty = int(float(raw_qty)) if not pd.isna(raw_qty) else 1
-                                qty = max(1, qty)
+                                col_qty = int(float(raw_qty)) if not pd.isna(raw_qty) else 1
+                                col_qty = max(1, col_qty)
                             except Exception:
-                                qty = 1
+                                col_qty = 1
+                            extracted_qty = sum(zone_counts.values())
+                            qty = max(1, extracted_qty) if extracted_qty > 0 else col_qty
 
                             # 夜衝數量解析 (彈性支援獨立夜衝帳數或原是否夜衝欄位)
                             raw_rush_qty = row.get("夜衝數量", row.get("夜衝帳數/間數", row.get("night_rush_quantity", None)))
@@ -3085,6 +3158,10 @@ def render_import_export_view():
 
                             # 備註解析 (NaN/空白安全處理，詳見 parse_import_notes)
                             notes = parse_import_notes(row, notes_col)
+                            # 區域字串正規化後若有變動 (關鍵字變體/未知格式)，
+                            # 將原始字串附加至備註，確保區域描述細節不遺失
+                            if area.replace(" ", "") != area_raw.replace(" ", ""):
+                                notes = (f"{notes} " if notes else "") + f"[原始區域字串: {area_raw}]"
 
                             if not name or not phone:
                                 skip_count += 1
